@@ -1,0 +1,24 @@
+{
+  "name": "jevsql",
+  "version": "0.1.0",
+  "description": "SQL with natural-language predicates, powered by TypeSafe's Jev. Filter, rank, classify and score rows with jev_noul/jev_choice/jev_score — batched, cached and cost-guarded.",
+  "type": "module",
+  "main": "src/engine.mjs",
+  "exports": {
+    ".": "./src/engine.mjs",
+    "./client": "./src/client.mjs",
+    "./cache": "./src/cache.mjs"
+  },
+  "bin": { "jevsql": "bin/jevsql.mjs" },
+  "files": ["src", "bin", "examples", "README.md", "LICENSE"],
+  "engines": { "node": ">=22.5" },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.mjs\"",
+    "demo": "node examples/demo.mjs"
+  },
+  "keywords": ["typesafe", "jev", "system-one", "sql", "sqlite", "llm", "classification", "semantic-sql", "ai-database"],
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/EugeneBoondock/jevsql.git" },
+  "bugs": { "url": "https://github.com/EugeneBoondock/jevsql/issues" },
+  "homepage": "https://github.com/EugeneBoondock/jevsql#readme"
+}

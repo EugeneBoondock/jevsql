@@ -1,0 +1,15 @@
+.env
+.env.*
+!.env.example
+node_modules/
+*.log
+
+# judgment caches (may contain your data)
+.jevsql-cache.json
+examples/.demo-cache.json
+*.jevsql-cache.json
+
+# local databases
+*.db
+*.sqlite
+*.sqlite3
