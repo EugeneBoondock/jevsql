@@ -28,7 +28,7 @@ import { scriptedControlClient } from './control-plane.mjs';
 
 const BOLD = '[1m', DIM = '[2m', RESET = '[0m';
 const GREEN = '[32m', RED = '[31m', YELLOW = '[33m', CYAN = '[36m', GREY = '[90m';
-const plain = () => process.env.NO_COLOR || !process.stdout.isTTY;
+const plain = () => process.env.NO_COLOR || (!process.stdout.isTTY && !process.env.FORCE_COLOR);
 const paint = (colour, value) => (plain() ? String(value) : `${colour}${value}${RESET}`);
 
 let step = 0;
