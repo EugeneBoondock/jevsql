@@ -1,0 +1,12 @@
+{
+  "checks": [
+    {
+      "name": "Published claims have direct support",
+      "sql": "SELECT id, claim, prediction, confidence FROM evidence_decisions WHERE prediction <> 'supported' OR confidence < 0.8"
+    },
+    {
+      "name": "Decision keys are present",
+      "sql": "SELECT * FROM evidence_decisions WHERE id IS NULL"
+    }
+  ]
+}

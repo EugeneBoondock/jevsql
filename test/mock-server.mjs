@@ -2,7 +2,7 @@
 // It answers with deterministic, keyword-driven judgments and counts requests.
 import http from 'node:http';
 
-export async function startMockServer({ latencyMs = 0 } = {}) {
+export async function startMockServer({ latencyMs = 0, answerFor } = {}) {
   const calls = [];
   const server = http.createServer(async (req, res) => {
     let raw = '';
@@ -23,6 +23,11 @@ export async function startMockServer({ latencyMs = 0 } = {}) {
       const text = String(body.state?.rows?.[path] ?? '').toLowerCase();
       const question = String(q.instructions?.question ?? '').toLowerCase();
       inputTokens += (question.length + 40) / 4;
+
+      if (answerFor) {
+        const answer = answerFor(q, body.state?.rows?.[path], body);
+        if (answer !== undefined) { answers[id] = answer; continue; }
+      }
 
       if (q.type === 'noul') {
         // "angry" style questions key off the text; everything else is a mild no.

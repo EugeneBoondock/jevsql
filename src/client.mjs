@@ -1,5 +1,7 @@
 // TypeSafe System One HTTP client: one request carries many rows and many
 // questions, with retries on the transient statuses the API documents.
+import { setTimeout as delay } from 'node:timers/promises';
+import { integer } from './validation.mjs';
 const DEFAULT_BASE_URL = 'https://api.typesafe.ai';
 const RETRYABLE = new Set([408, 429, 500, 502, 503, 504, 529]);
 
@@ -11,8 +13,8 @@ export class JevClient {
     this.apiKey = apiKey;
     this.baseUrl = (baseUrl ?? process.env.TYPESAFE_BASE_URL ?? DEFAULT_BASE_URL).replace(/\/$/, '');
     this.model = model ?? process.env.TYPESAFE_DEFAULT_MODEL ?? 'jev-latest';
-    this.timeoutMs = timeoutMs;
-    this.maxAttempts = maxAttempts;
+    this.timeoutMs = integer(timeoutMs, 'timeoutMs');
+    this.maxAttempts = integer(maxAttempts, 'maxAttempts', 1, 10);
     this.fetch = fetchImpl;
     this.stats = { requests: 0, questions: 0, inputTokens: 0, outputTokens: 0, latencyMs: 0, retries: 0 };
   }
@@ -20,18 +22,20 @@ export class JevClient {
   get costUsd() { return this.stats.inputTokens * USD_PER_INPUT_TOKEN; }
 
   /** Evaluate one state against a map of questions. */
-  async evaluate(state, questions) {
+  async evaluate(state, questions, { signal } = {}) {
     const body = JSON.stringify({ model: this.model, state, questions });
     const started = performance.now();
     let lastError;
 
     for (let attempt = 1; attempt <= this.maxAttempts; attempt++) {
+      signal?.throwIfAborted();
+      let retryDelay = Math.min(30000, 400 * 2 ** (attempt - 1));
       try {
         const res = await this.fetch(`${this.baseUrl}/v1/systemone`, {
           method: 'POST',
           headers: { Authorization: `Bearer ${this.apiKey}`, 'Content-Type': 'application/json' },
           body,
-          signal: AbortSignal.timeout(this.timeoutMs),
+          signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(this.timeoutMs)]) : AbortSignal.timeout(this.timeoutMs),
         });
         if (res.ok) {
           const data = await res.json();
@@ -44,7 +48,13 @@ export class JevClient {
         }
         lastError = new Error(`TypeSafe ${res.status}: ${(await res.text()).slice(0, 200)}`);
         if (!RETRYABLE.has(res.status)) throw lastError;
+        const retryAfter = res.headers.get('retry-after');
+        if (retryAfter) {
+          const wait = /^\d+(\.\d+)?$/.test(retryAfter) ? Number(retryAfter) * 1000 : Date.parse(retryAfter) - Date.now();
+          if (Number.isFinite(wait)) retryDelay = Math.max(retryDelay, Math.min(30000, Math.max(0, wait)));
+        }
       } catch (err) {
+        signal?.throwIfAborted();
         lastError = err;
         const transient = err.name === 'TimeoutError' || err.name === 'AbortError' || err.name === 'TypeError'
           || /TypeSafe (408|429|5\d\d)/.test(err.message);
@@ -52,7 +62,7 @@ export class JevClient {
       }
       if (attempt < this.maxAttempts) {
         this.stats.retries += 1;
-        await new Promise((r) => setTimeout(r, 400 * 2 ** (attempt - 1)));
+        await delay(retryDelay, undefined, { signal });
       }
     }
     throw lastError;

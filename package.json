@@ -1,20 +1,29 @@
 {
   "name": "jevsql",
   "version": "0.1.0",
-  "description": "SQL with natural-language predicates, powered by TypeSafe's Jev. Filter, rank, classify and score rows with jev_noul/jev_choice/jev_score — batched, cached and cost-guarded.",
+  "description": "Decision tables for AI-era databases: semantic matching, source-backed extraction, evidence checks, change history and measured review queues, powered by TypeSafe Jev.",
   "type": "module",
   "main": "src/engine.mjs",
   "exports": {
     ".": "./src/engine.mjs",
     "./client": "./src/client.mjs",
-    "./cache": "./src/cache.mjs"
+    "./cache": "./src/cache.mjs",
+    "./control": "./src/control-plane.mjs",
+    "./schema": "./src/schema.mjs",
+    "./telemetry": "./src/telemetry.mjs",
+    "./metrics": "./src/metrics.mjs",
+    "./adapters": "./src/adapters.mjs",
+    "./queries": "./src/query-compiler.mjs",
+    "./evaluation": "./src/evaluation.mjs"
   },
   "bin": { "jevsql": "bin/jevsql.mjs" },
-  "files": ["src", "bin", "examples", "README.md", "LICENSE"],
-  "engines": { "node": ">=22.5" },
+  "files": ["src", "bin", "examples", "docs", "README.md", "LICENSE"],
+  "engines": { "node": ">=22.16" },
   "scripts": {
     "test": "node --test \"test/**/*.test.mjs\"",
-    "demo": "node examples/demo.mjs"
+    "demo": "node examples/demo.mjs",
+    "control": "node examples/control-plane.mjs",
+    "workflows": "node examples/workflows.mjs"
   },
   "keywords": ["typesafe", "jev", "system-one", "sql", "sqlite", "llm", "classification", "semantic-sql", "ai-database"],
   "license": "MIT",

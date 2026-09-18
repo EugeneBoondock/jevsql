@@ -1,5 +1,5 @@
-// Content-addressed cache of judgments. Jev is self-consistent for a fixed input,
-// so the same row + question never needs paying for twice. Survives restarts.
+// Content-addressed cache of recorded judgments. Reuse is a caller policy,
+// not a guarantee that a new model call would give the same answer.
 import { mkdirSync, readFileSync, writeFileSync, existsSync, renameSync } from 'node:fs';
 import path from 'node:path';
 
