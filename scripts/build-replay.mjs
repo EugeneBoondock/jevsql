@@ -14,7 +14,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const out = path.join(root, 'scripts', 'out');
 mkdirSync(out, { recursive: true });
 
-const raw = execFileSync(process.execPath, [path.join(root, 'examples', 'showcase.mjs')],
+const raw = execFileSync(process.execPath, [path.join(root, 'examples', process.argv[2] ?? 'contrast.mjs')],
   { env: { ...process.env, FORCE_COLOR: '1' }, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
 
 const COLOURS = { 31: 'red', 32: 'green', 33: 'yellow', 36: 'cyan', 90: 'grey' };
@@ -78,7 +78,7 @@ const page = `<!doctype html>
       <span class="dot" style="background:#ff5f57"></span>
       <span class="dot" style="background:#febc2e"></span>
       <span class="dot" style="background:#28c840"></span>
-      <span class="title">jevsql — npm run showcase</span>
+      <span class="title">jevsql — node examples/contrast.mjs</span>
     </div>
     <pre id="out"></pre>
   </div>

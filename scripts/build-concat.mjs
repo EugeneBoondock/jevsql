@@ -2,7 +2,7 @@
 import { execFileSync } from 'node:child_process';
 import { writeFileSync } from 'node:fs';
 
-const raw = execFileSync(process.execPath, ['examples/showcase.mjs'], { encoding: 'utf8', maxBuffer: 8e6 });
+const raw = execFileSync(process.execPath, [`examples/${process.argv[2] ?? 'contrast.mjs'}`], { encoding: 'utf8', maxBuffer: 8e6 });
 const lines = raw.replace(/\r/g, '').split('\n');
 while (lines.length && !lines.at(-1).trim()) lines.pop();
 

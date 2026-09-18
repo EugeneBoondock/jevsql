@@ -35,7 +35,8 @@
     "demo": "node examples/demo.mjs",
     "control": "node examples/control-plane.mjs",
     "workflows": "node examples/workflows.mjs",
-    "showcase": "node examples/showcase.mjs"
+    "showcase": "node examples/showcase.mjs",
+    "contrast": "node examples/contrast.mjs"
   },
   "keywords": ["typesafe", "jev", "system-one", "sql", "sqlite", "llm", "classification", "semantic-sql", "ai-database"],
   "license": "MIT",

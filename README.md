@@ -18,6 +18,28 @@ JevSQL adds TypeSafe Jev judgments to SQLite. It can compare records by meaning,
 | Nobody knows which confidence threshold is useful | Evaluate labeled rows once and compare accuracy, coverage, and review workload across thresholds. |
 | A database passes structural checks but contains unsupported decisions | Run semantic data checks in CI with explicit failure exit codes. |
 
+## What breaks without it
+
+```bash
+node examples/contrast.mjs
+```
+
+Five failures, each executed on both sides — the numbers below are what the queries actually returned, not a description of what would happen.
+
+| | Ordinary tooling | JevSQL |
+|---|---|---|
+| Revenue joined to line items | runs clean, returns **3750** (real revenue: 1250) | refuses to compile: the join can multiply aggregate rows |
+| `WITH gone AS (DELETE FROM orders …) SELECT …` | leading-keyword guard says **read-only, allowed** — 3 orders and 9 line items gone | classified `delete`, destructive, no WHERE clause |
+| Tenant id interpolated from the request | returns **1250** for `tenant-a' OR '1'='1'` | returns **350**; the tenant comes from the authenticated actor |
+| `up` then `down`, both exit 0 | **"rolled back successfully"** — 3 rows → 0 | rejected: schema restored, rows **not** restored |
+| Finding billing complaints in support tickets | keyword search: 3/5 found, 3 false positives | `jev_bool(...)`: 5/5, 0 false positives, one request, $0.000046 |
+
+The last row calls the live API. The other four need no key and no network.
+
+Every wrong answer in that list ran cleanly and returned a number somebody would have believed. That is the failure mode this project exists for: not queries that crash, but queries that succeed and are wrong.
+
+> The ticket sample is ten rows. It shows the shape of the difference, not a calibration result — see [what this project has not established](#what-this-project-has-not-established).
+
 ## Try it immediately
 
 Use **Node 22.16+**. The project uses the built-in `node:sqlite` module, including [statement column metadata](https://nodejs.org/api/sqlite.html#statementcolumns).
