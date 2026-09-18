@@ -85,8 +85,11 @@ export class GovernedQueries {
       } },
     }, accept: [{ question: 'matches', min: this.minSuitability }, { question: 'category', equals: 'routine_read', minConfidence: this.minConfidence }] };
     const receipt = await this.service.review(policy, { request, template: { id: template.id, description: template.description, query: template.query }, parameters: supplied,
-      compiled_sql: compiled.sql, enforced_scope: { tenant: identity.tenantId == null ? 'not tenant scoped' : 'authenticated current tenant',
-        tenantFilteredTables: compiled.tenantScopedTables, parameterBinding: 'All values are bound by the trusted compiler; tenant values come from the authenticated actor.',
+      compiled_sql: compiled.sql, enforced_scope: {
+        tenant: identity.tenantId == null ? 'not tenant scoped'
+          : compiled.tenantScopedTables.length ? 'authenticated current tenant'
+            : 'authenticated actor, but no table in this query carries a tenant filter',
+        tenantFilteredTables: compiled.tenantScopedTables, tablesDeclaredShared: compiled.sharedTables, parameterBinding: 'All values are bound by the trusted compiler; tenant values come from the authenticated actor.',
         maximumResultRows: compiled.maxRows } }, {
       context: { dialect: compiled.dialect, schemaVersion: compiled.schemaHash, templateVersion: template.version,
         templateHash: compiled.templateHash, actorHash: compiled.actorHash, paramsHash: compiled.paramsHash }, signal, dryRun,

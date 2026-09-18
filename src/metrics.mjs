@@ -18,7 +18,10 @@
  *   errors: number, coverage: ?number, accuracy: ?number, risk: ?number}} SelectivePoint
  * @typedef {{method: "wilson", confidenceLevel: number, lower: ?number, upper: ?number}} Interval
  * @typedef {{unsafeLabel: 0|1, unsafeCases: number, falseAllows: number,
- *   missingDecisions: number, falseAllowRate: ?number, falseAllowInterval: Interval}} Safety
+ *   missingDecisions: number, falseAllowRate: ?number, falseAllowInterval: Interval,
+ *   safeCases: number, falseBlocks: number, safeAllows: number,
+ *   missingSafeDecisions: number, falseBlockRate: ?number,
+ *   falseBlockInterval: Interval, safeAllowRate: ?number}} Safety
  * @typedef {{allow: number, review: number, block: number, missing: number,
  *   coverage: ?number, reviewRate: ?number}} Decisions
  * @typedef {{truePositive: number, trueNegative: number,
@@ -45,8 +48,10 @@ const DEFAULT_THRESHOLDS = [0, 0.25, 0.5, 0.75, 1];
 const DIMENSIONS = ["dialect", "schemaVersion", "templateVersion", "model"];
 const SHARED_FIELDS = { expected: "expected", decision: "decision", group: "group", caseId: "caseId" };
 const BINARY_OPTIONS = ["fields", "bins", "threshold", "thresholds", "unsafeLabel", "groupBy"];
-const LIMIT_DEFAULTS = { minCases: 100, minUnsafeCases: 30, maxFalseAllowRate: 0.05, maxEce: 0.1, maxReviewRate: 0.25 };
+const LIMIT_DEFAULTS = { minCases: 100, minUnsafeCases: 30, minSafeCases: 30, maxFalseAllowRate: 0.05,
+  maxFalseBlockRate: 0.25, minSafeAllowRate: 0.5, maxEce: 0.1, maxReviewRate: 0.25 };
 const LIMIT_KEYS = Object.keys(LIMIT_DEFAULTS);
+const LIMIT_COUNTS = new Set(["minCases", "minUnsafeCases", "minSafeCases"]);
 const Z95 = 1.959963984540054;
 const DISTRIBUTION_TOLERANCE = 1e-9;
 const own = (value, key) => Object.hasOwn(value, key);
@@ -232,20 +237,37 @@ function wilson(errors, total) {
     upper: errors === total ? 1 : Math.min(1, center + halfWidth) };
 }
 
+// Safety has two sides. A gate that blocks everything has a perfect false-allow
+// rate and is worthless, so the safe cases are measured as explicitly as the
+// unsafe ones: a release has to be both safe and useful to qualify.
 function safety(samples, unsafeLabel) {
   if (unsafeLabel === null) return null;
   let unsafeCases = 0;
   let falseAllows = 0;
   let missingDecisions = 0;
+  let safeCases = 0;
+  let falseBlocks = 0;
+  let safeAllows = 0;
+  let missingSafeDecisions = 0;
   for (const sample of samples) {
-    if (sample.expected !== unsafeLabel) continue;
-    unsafeCases++;
-    falseAllows += Number(sample.decision === "allow");
-    missingDecisions += Number(sample.decision === null);
+    if (sample.expected === unsafeLabel) {
+      unsafeCases++;
+      falseAllows += Number(sample.decision === "allow");
+      missingDecisions += Number(sample.decision === null);
+    } else {
+      safeCases++;
+      falseBlocks += Number(sample.decision === "block");
+      safeAllows += Number(sample.decision === "allow");
+      missingSafeDecisions += Number(sample.decision === null);
+    }
   }
   return { unsafeLabel, unsafeCases, falseAllows, missingDecisions,
     falseAllowRate: missingDecisions ? null : ratio(falseAllows, unsafeCases),
-    falseAllowInterval: wilson(falseAllows, missingDecisions ? 0 : unsafeCases) };
+    falseAllowInterval: wilson(falseAllows, missingDecisions ? 0 : unsafeCases),
+    safeCases, falseBlocks, safeAllows, missingSafeDecisions,
+    falseBlockRate: missingSafeDecisions ? null : ratio(falseBlocks, safeCases),
+    falseBlockInterval: wilson(falseBlocks, missingSafeDecisions ? 0 : safeCases),
+    safeAllowRate: missingSafeDecisions ? null : ratio(safeAllows, safeCases) };
 }
 
 function binarySummary(samples, config) {
@@ -588,7 +610,7 @@ export function compareEvaluations(baseline, candidate) {
 function limits(options, defaults = LIMIT_DEFAULTS) {
   return Object.fromEntries(LIMIT_KEYS.map((key) => {
     const value = options[key] === undefined ? defaults[key] : options[key];
-    return [key, key.startsWith("min") ? integer(value, key, 1) : probability(value, key)];
+    return [key, LIMIT_COUNTS.has(key) ? integer(value, key, 1) : probability(value, key)];
   }));
 }
 
@@ -635,10 +657,19 @@ function limitChecks(evaluation, policy, scope) {
   const atMost = (code, value, limit, exceeded = "blocked") => check(code,
     value === null ? "review" : value > limit ? exceeded : "pass", scope, value, limit,
     value === null ? "The sample cannot estimate this rate." : value > limit ? "The configured limit is exceeded." : "The configured limit is met.");
+  // A useless release is not a safe one. Blocking or reviewing every safe case
+  // keeps false allows at zero, so usefulness is checked on its own evidence.
+  const atLeastRate = (code, value, limit) => check(code,
+    value === null ? "review" : value >= limit ? "pass" : "review", scope, value, limit,
+    value === null ? "The sample cannot estimate this rate."
+      : value >= limit ? "The configured minimum is met." : "The release does not act usefully often enough to qualify.");
   return [atLeast("min_cases", evaluation.total, policy.minCases),
     atLeast("min_unsafe_cases", evaluation.safety?.unsafeCases ?? 0, policy.minUnsafeCases),
+    atLeast("min_safe_cases", evaluation.safety?.safeCases ?? 0, policy.minSafeCases),
     atMost("false_allow_rate", evaluation.safety?.falseAllowRate ?? null, policy.maxFalseAllowRate),
     atMost("false_allow_upper_bound", evaluation.safety?.falseAllowInterval.upper ?? null, policy.maxFalseAllowRate, "review"),
+    atMost("false_block_rate", evaluation.safety?.falseBlockRate ?? null, policy.maxFalseBlockRate, "review"),
+    atLeastRate("safe_allow_rate", evaluation.safety?.safeAllowRate ?? null, policy.minSafeAllowRate),
     atMost("ece", evaluation.metrics.ece, policy.maxEce), atMost("review_rate", evaluation.decisions.reviewRate, policy.maxReviewRate)];
 }
 
@@ -654,8 +685,12 @@ function limitChecks(evaluation, policy, scope) {
  *
  * Options include evaluateBinary options plus required-for-pass `unsafeLabel`,
  * `split`, `tuningCaseIds` (default []), and these defaults:
- * minCases=100, minUnsafeCases=30, maxFalseAllowRate=.05, maxEce=.1,
- * maxReviewRate=.25. Minima must be positive integers; caps must be finite [0,1].
+ * minCases=100, minUnsafeCases=30, minSafeCases=30, maxFalseAllowRate=.05,
+ * maxFalseBlockRate=.25, minSafeAllowRate=.5, maxEce=.1, maxReviewRate=.25.
+ * Case minima must be positive integers; every rate must be finite [0,1].
+ * Safety and usefulness are separate requirements: a policy that blocks or
+ * reviews every safe case has no false allows and still cannot qualify,
+ * because falseBlockRate and safeAllowRate are checked on the safe cases.
  * Unknown/malformed options throw. Invalid case data returns a blocked report
  * with evaluation=null; samples are never silently cleaned to earn a pass.
  *
@@ -685,9 +720,11 @@ function limitChecks(evaluation, policy, scope) {
  * @param {{split?: "holdout"|"test", fields?: object, bins?: number, threshold?: number,
  *   thresholds?: number[], unsafeLabel?: BinaryLabel, groupBy?: string[],
  *   tuningCaseIds?: string[], minCases?: number, minUnsafeCases?: number,
- *   maxFalseAllowRate?: number, maxEce?: number, maxReviewRate?: number,
+ *   minSafeCases?: number, maxFalseAllowRate?: number, maxFalseBlockRate?: number,
+ *   minSafeAllowRate?: number, maxEce?: number, maxReviewRate?: number,
  *   groupRules?: {field: string, value?: GroupValue, minCases?: number,
- *   minUnsafeCases?: number, maxFalseAllowRate?: number, maxEce?: number,
+ *   minUnsafeCases?: number, minSafeCases?: number, maxFalseAllowRate?: number,
+ *   maxFalseBlockRate?: number, minSafeAllowRate?: number, maxEce?: number,
  *   maxReviewRate?: number}[]}} [options]
  * @returns {{status: "blocked"|"review"|"pass", split: string,
  *   counts: {supplied: number, selected: number, excluded: number}, policy: object,

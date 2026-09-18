@@ -1,4 +1,4 @@
-import { readQuery, bindAll } from './sql.mjs';
+import { readQuery, bindAll, maskSql, topLevelWords } from './sql.mjs';
 import { quoteIdentifier as qi } from './validation.mjs';
 import { redactText, digest } from './privacy.mjs';
 
@@ -60,6 +60,68 @@ export function sqlMetadata(sql, { dialect = 'sqlite' } = {}) {
   return { sql: redactText(out), commentsRemoved: comments, literalsRemoved: literals, dialect };
 }
 
+const DATA_WRITES = ['INSERT', 'UPDATE', 'DELETE', 'MERGE', 'REPLACE', 'TRUNCATE', 'UPSERT'];
+const SCHEMA_WRITES = ['CREATE', 'DROP', 'ALTER', 'RENAME', 'COMMENT'];
+const PERMISSION_WRITES = ['GRANT', 'REVOKE'];
+const MAINTENANCE = ['VACUUM', 'ANALYZE', 'REINDEX', 'CHECKPOINT', 'CLUSTER', 'OPTIMIZE', 'REPAIR'];
+const CLASS_BY_HEAD = {
+  SELECT: 'read', WITH: 'read', VALUES: 'read', TABLE: 'read', EXPLAIN: 'read', SHOW: 'read', DESCRIBE: 'read',
+  INSERT: 'insert', REPLACE: 'insert', UPSERT: 'insert', MERGE: 'update', UPDATE: 'update',
+  DELETE: 'delete', TRUNCATE: 'delete',
+  CREATE: 'schema', DROP: 'schema', ALTER: 'schema', RENAME: 'schema', COMMENT: 'schema',
+  GRANT: 'permission', REVOKE: 'permission',
+  VACUUM: 'maintenance', ANALYZE: 'maintenance', REINDEX: 'maintenance', CHECKPOINT: 'maintenance',
+  CLUSTER: 'maintenance', OPTIMIZE: 'maintenance', REPAIR: 'maintenance',
+};
+
+/**
+ * Classify a proposed statement from its text alone, without a database and
+ * without executing anything. This is the deterministic half of the guardrail:
+ * it decides the operation class and whether the statement is destructive or
+ * unbounded, so that a model answer is never what permits a write.
+ *
+ * Quoted identifiers and comments are masked before keywords are read, so a
+ * column named "drop" is not a DROP. A data-changing keyword anywhere, including
+ * inside a writable CTE, still counts. Classification is deliberately
+ * pessimistic: anything it cannot resolve is unknown, which never auto-runs.
+ *
+ * @returns {{operation: string, statementCount: number, changesData: boolean,
+ *   changesSchema: boolean, changesPermissions: boolean, destructive: boolean,
+ *   unbounded: boolean, filtered: boolean, limited: boolean, reasons: string[],
+ *   sql: string, dialect: string}}
+ */
+export function classifyStatement(input, { dialect = 'sqlite' } = {}) {
+  const metadata = sqlMetadata(input, { dialect });
+  const masked = maskSql(input);
+  const words = [...masked.matchAll(/[A-Za-z_][A-Za-z0-9_]*/g)].map((match) => match[0].toUpperCase());
+  const has = (word) => words.includes(word);
+  const head = topLevelWords(input)[0]?.word ?? words[0] ?? null;
+  const statementCount = [...masked.matchAll(/;/g)].filter((match) => masked.slice(match.index + 1).trim()).length + 1;
+  const changesData = DATA_WRITES.some(has);
+  const changesSchema = SCHEMA_WRITES.some(has);
+  const changesPermissions = PERMISSION_WRITES.some(has);
+  const filtered = has('WHERE');
+  const limited = has('LIMIT') || has('FETCH') || has('TOP');
+  const reasons = [];
+  if (has('DROP')) reasons.push('drops a schema object');
+  if (has('TRUNCATE')) reasons.push('truncates a table');
+  if (has('DELETE') && !filtered) reasons.push('deletes without a WHERE clause');
+  if (has('UPDATE') && !filtered) reasons.push('updates without a WHERE clause');
+  if (has('REVOKE')) reasons.push('removes a granted permission');
+  if (has('DETACH') || has('DEALLOCATE')) reasons.push('detaches a database object');
+  // The leading keyword is the weakest evidence: a writable CTE starts with WITH
+  // and still deletes. Classify by the strongest operation present anywhere.
+  const operation = changesPermissions ? 'permission'
+    : changesSchema ? 'schema'
+      : has('DELETE') || has('TRUNCATE') ? 'delete'
+        : has('UPDATE') || has('MERGE') ? 'update'
+          : has('INSERT') || has('REPLACE') || has('UPSERT') ? 'insert'
+            : CLASS_BY_HEAD[head] ?? (MAINTENANCE.some(has) ? 'maintenance' : 'unknown');
+  return { operation, statementCount, changesData, changesSchema, changesPermissions,
+    destructive: reasons.length > 0, unbounded: (changesData || changesSchema) && !filtered && !limited,
+    filtered, limited, reasons, sql: metadata.sql, dialect };
+}
+
 /** SQLite compiles EXPLAIN without running the candidate statement. Its bytecode
  * exposes reads through subqueries, views, and CTEs, and catches writable CTEs.
  * This deliberately refuses virtual sources and unapproved functions.
@@ -76,12 +138,34 @@ export function inspectQuery(db, input, { params = [], allowedTables, deniedColu
   }
   const roots = new Map(), cursors = new Map(), tables = new Set(), columns = new Set(), functions = new Set();
   for (const database of db.prepare('PRAGMA database_list').all()) {
-    roots.set(`${database.seq}:1`, { table: `${database.name}.sqlite_schema`, columns: ['type', 'name', 'tbl_name', 'rootpage', 'sql'] });
+    const properties = new Map(db.prepare(`PRAGMA ${qi(database.name)}.table_list`).all()
+      .filter((row) => row.schema === database.name).map((row) => [row.name, row]));
+    // A rowid table reads its INTEGER PRIMARY KEY through Rowid, never Column.
+    const rowidAlias = (table) => {
+      if (properties.get(table)?.wr) return null;
+      const key = db.prepare(`PRAGMA ${qi(database.name)}.table_info(${qi(table)})`).all().filter((column) => column.pk);
+      return key.length === 1 && key[0].type.toUpperCase() === 'INTEGER' ? key[0].name : null;
+    };
+    roots.set(`${database.seq}:1`, { table: `${database.name}.sqlite_schema`,
+      columns: ['type', 'name', 'tbl_name', 'rootpage', 'sql'], rowidColumn: null });
     for (const entry of db.prepare(`SELECT name,tbl_name,type,rootpage FROM ${qi(database.name)}.sqlite_schema WHERE rootpage>0`).all()) {
-      const names = entry.type === 'index'
-        ? db.prepare(`PRAGMA ${qi(database.name)}.index_info(${qi(entry.name)})`).all().map((column) => column.name)
-        : db.prepare(`PRAGMA ${qi(database.name)}.table_info(${qi(entry.name)})`).all().map((column) => column.name);
-      roots.set(`${database.seq}:${entry.rootpage}`, { table: `${database.name}.${entry.tbl_name}`, columns: names });
+      let names;
+      if (entry.type === 'index') {
+        // index_xinfo is the physical record order, including trailing key columns.
+        // An expression term has no column name and stays deliberately unresolved.
+        names = db.prepare(`PRAGMA ${qi(database.name)}.index_xinfo(${qi(entry.name)})`).all()
+          .sort((a, b) => a.seqno - b.seqno).map((column) => column.name ?? null);
+      } else {
+        const info = db.prepare(`PRAGMA ${qi(database.name)}.table_info(${qi(entry.name)})`).all();
+        const key = info.filter((column) => column.pk).sort((a, b) => a.pk - b.pk);
+        // A WITHOUT ROWID row is stored key-first, so declared order is not the
+        // physical order and reading table_info positions names the wrong column.
+        names = properties.get(entry.name)?.wr
+          ? [...key.map((column) => column.name), ...info.filter((column) => !column.pk).map((column) => column.name)]
+          : info.map((column) => column.name);
+      }
+      roots.set(`${database.seq}:${entry.rootpage}`, { table: `${database.name}.${entry.tbl_name}`,
+        columns: names, rowidColumn: rowidAlias(entry.tbl_name) });
     }
   }
   for (const opcode of opcodes) {
@@ -97,14 +181,27 @@ export function inspectQuery(db, input, { params = [], allowedTables, deniedColu
       if (!PURE_FUNCTIONS.has(name) && !allowedFunctions.includes(name)) fail('unapproved_function', `Function ${name} is outside the approved set.`);
     }
   }
+  let unresolvedReads = 0;
   for (const opcode of opcodes) {
     const source = cursors.get(opcode.p1);
-    if (opcode.opcode === 'Column' && source?.columns[opcode.p2]) columns.add(`${source.table}.${source.columns[opcode.p2]}`);
+    if (!source) continue;
+    if (opcode.opcode === 'Column') {
+      const name = source.columns[opcode.p2];
+      if (name) columns.add(`${source.table}.${name}`);
+      else unresolvedReads++;
+    }
+    // The rowid is a readable value: an INTEGER PRIMARY KEY alias when one is
+    // declared, otherwise the implicit rowid, which a policy can also deny.
+    if (['Rowid', 'IdxRowid'].includes(opcode.opcode)) columns.add(`${source.table}.${source.rowidColumn ?? 'rowid'}`);
   }
   const allowed = allowedTables == null ? null : new Set(allowedTables.map((name) => (name.includes('.') ? name : `main.${name}`).toLowerCase()));
   for (const table of tables) if (allowed && !allowed.has(table.toLowerCase())) fail('table_not_allowed', `Table ${table} is outside the permitted scope.`);
   const denied = new Set(deniedColumns.map((name) => (name.split('.').length === 2 ? `main.${name}` : name).toLowerCase()));
   for (const column of columns) if (denied.has(column.toLowerCase())) fail('column_not_allowed', `Column ${column} is outside the permitted scope.`);
+  // A column rule can only be enforced over reads this inspection could name.
+  if (denied.size && unresolvedReads) {
+    fail('unresolved_column_read', `${unresolvedReads} read(s) could not be resolved to a named column while a column policy applies.`);
+  }
   const plan = bindAll(db.prepare(`EXPLAIN QUERY PLAN ${sql}`), params).map((row) => ({ id: row.id, parent: row.parent, detail: row.detail }));
   return { valid: true, readOnly: !findings.some((item) => ['mutation', 'unapproved_function', 'virtual_source', 'unknown_source'].includes(item.code)),
     tables: [...tables], columns: [...columns], functions: [...functions], findings,

@@ -94,7 +94,7 @@ function nodeFor(nodes, parentId, operation) {
     rowsRemovedPerLoop: null, observedRowsTotal: null, filteredOutRatio: null,
     actualTimePerLoopMs: null, actualTotalTimeMs: null,
     estimatedStartupCost: null, estimatedTotalCost: null,
-    sort: null, temporaryStructure: false, io: emptyIo(),
+    sort: null, hash: null, temporaryStructure: false, io: emptyIo(),
   };
   nodes.push(node);
   return node;
@@ -138,6 +138,32 @@ function pgSort(raw) {
   return { method: text(raw['Sort Method']), spilled: spilled ? true : measured && evidence.every((item) => item.spilled === false) ? false : null, evidence };
 }
 
+// A hashed aggregate or hash join that exceeds work_mem reports its batches and
+// disk usage rather than a sort method, so it is separate evidence from pgSort.
+// More batches than planned, or any disk usage, is a measured spill.
+function pgHash(raw) {
+  const evidence = [];
+  let spilled = false;
+  const scopes = [{ raw, source: 'leader' }];
+  if (Array.isArray(raw.Workers)) {
+    raw.Workers.forEach((worker, i) => { if (isRecord(worker)) scopes.push({ raw: worker, source: `worker:${i}` }); });
+  }
+  for (const scope of scopes) {
+    const diskKb = measurement(scope.raw['Disk Usage']);
+    const peakMemoryKb = measurement(scope.raw['Peak Memory Usage']);
+    const aggBatches = measurement(scope.raw['HashAgg Batches']);
+    const batches = measurement(scope.raw['Hash Batches']);
+    const originalBatches = measurement(scope.raw['Original Hash Batches']);
+    const plannedPartitions = measurement(scope.raw['Planned Partitions']);
+    const fields = [diskKb, peakMemoryKb, aggBatches, batches, originalBatches, plannedPartitions];
+    if (fields.every((value) => value === null)) continue;
+    const disk = diskKb > 0 || aggBatches > 1 || batches > 1;
+    spilled ||= disk;
+    evidence.push({ source: scope.source, diskKb, peakMemoryKb, aggBatches, batches, originalBatches, plannedPartitions, spilled: disk });
+  }
+  return evidence.length ? { spilled, evidence } : null;
+}
+
 function postgresNodes(plan, nodes) {
   const entries = Array.isArray(plan) ? plan : [plan];
   const stack = [];
@@ -168,6 +194,7 @@ function postgresNodes(plan, nodes) {
     node.estimatedStartupCost = measurement(raw['Startup Cost']);
     node.estimatedTotalCost = measurement(raw['Total Cost']);
     if (/\bSort\b/i.test(node.operation)) node.sort = pgSort(raw);
+    if (/Hash/i.test(node.operation)) node.hash = pgHash(raw);
     for (const [key, field] of Object.entries(IO_FIELDS)) node.io[key] = measurement(raw[field]);
     for (let i = (raw.Plans?.length ?? 0) - 1; i >= 0; i--) stack.push({ raw: raw.Plans[i], parentId: node.id });
   }
@@ -280,6 +307,7 @@ function planSymptoms(nodes) {
     const c = node.cardinality;
     if (c.unboundedError || c.errorFactor >= 10) add(node, 'cardinality-mismatch', 'warning', { ...c });
     if (node.sort?.spilled === true) add(node, 'sort-spill', 'warning', { ...node.sort, evidence: node.sort.evidence.map((item) => ({ ...item })) });
+    if (node.hash?.spilled === true) add(node, 'hash-spill', 'warning', { ...node.hash, evidence: node.hash.evidence.map((item) => ({ ...item })) });
     if (node.sort?.method === 'filesort') add(node, 'filesort', 'info', { diskSpillKnown: false });
     if (node.temporaryStructure) add(node, 'temporary-structure', 'info', { diskSpillKnown: false });
     const reads = Object.fromEntries(['sharedReadBlocks', 'localReadBlocks'].filter((key) => node.io[key] > 0).map((key) => [key, node.io[key]]));
@@ -330,6 +358,9 @@ function planSymptoms(nodes) {
  * A repeated-full-scan requires >=10 loops and >=10,000 observed row visits.
  * Ordinary scans are not warnings. Filesort/temporary structures alone do not
  * prove a spill. Actual PG sort methods/space evidence can prove a spill.
+ * PostgreSQL hashed aggregates and hash joins report batches, planned
+ * partitions and disk usage instead of a sort method: those land in node.hash,
+ * and disk usage above zero or more batches than one is a hash-spill warning.
  *
  * @param {object|Array|string} plan
  * @param {{dialect?: 'postgresql'|'mysql'|'sqlite'}} [options]
@@ -365,6 +396,8 @@ export function analyzePlan(plan, { dialect = 'postgresql' } = {}) {
       indexNodes, accessNodes: accesses, indexAccessRatio: accesses ? indexNodes / accesses : null,
       sortNodes: nodes.filter((node) => node.sort !== null).length,
       sortSpillNodes: nodes.filter((node) => node.sort?.spilled === true).length,
+      hashNodes: nodes.filter((node) => node.hash !== null).length,
+      hashSpillNodes: nodes.filter((node) => node.hash?.spilled === true).length,
       cardinalityComparisons: nodes.filter((node) => ['match', 'underestimated', 'overestimated'].includes(node.cardinality.status)).length,
       cardinalityMismatchNodes: symptoms.filter((symptom) => symptom.name === 'cardinality-mismatch').length,
       unboundedCardinalityErrors: nodes.filter((node) => node.cardinality.unboundedError).length,

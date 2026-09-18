@@ -18,7 +18,7 @@ export function scriptedControlClient() {
   return { model: 'jevsql-scripted-control-v1', calls: [], async evaluate(state, questions) {
     this.calls.push({ state, questions });
     const answers = Object.fromEntries(Object.entries(questions).map(([id, question]) => {
-      if (question.type === 'noul') return [id, { type: 'noul', noul: /risk|breaks|overscoped|loses|contradictory|missing|sensitive|surprising|stale/.test(id) ? 0.01 : 0.99 }];
+      if (question.type === 'noul') return [id, { type: 'noul', noul: /risk|breaks|overscoped|loses|contradictory|missing|sensitive|surprising|stale|destructive|affects_shared|unexpected/.test(id) ? 0.01 : 0.99 }];
       const labels = question.type === 'choice' ? Object.keys(question.criteria) : question.criteria.map((_, index) => String(index));
       const probabilities = Object.fromEntries(labels.map((label, index) => [label, index ? 0.01 / (labels.length - 1) : 0.99]));
       return [id, { type: question.type, confidence: 0.99, probabilities,
@@ -57,6 +57,17 @@ export async function runControlDemo({ live = false } = {}) {
       try { await gate.execute(warm.permit, request); stalePermitRejected = false; }
       catch (error) { stalePermitRejected = /Schema changed/.test(error.message); }
     }
+    // The guardrail in front of a statement an agent proposed. Classification is
+    // deterministic, so a confident model answer cannot turn a DROP into a read.
+    const statements = [];
+    for (const [statement, intent] of [
+      ['SELECT total FROM orders WHERE tenant_id = ?', 'Read this tenant’s order totals'],
+      ['DROP TABLE orders', 'Clean up an unused table'],
+    ]) {
+      const verdict = await control.reviewStatement({ statement, intent, dialect: 'postgresql', environment: 'production', actor });
+      statements.push({ statement, operation: verdict.classification.operation, destructive: verdict.classification.destructive,
+        decision: verdict.decision, requiredApproval: verdict.requiredApproval, executed: verdict.statementExecuted });
+    }
     const triage = await control.triagePlan({ dialect: 'postgresql', plan: [{ Plan: {
       'Node Type': 'Seq Scan', 'Relation Name': 'orders', 'Plan Rows': 10000,
       'Actual Rows': 2, 'Actual Loops': 1, 'Shared Read Blocks': 1000, 'Shared Hit Blocks': 10,
@@ -83,6 +94,7 @@ export async function runControlDemo({ live = false } = {}) {
         answers: first.receipt.answers, reasons: first.receipt.reasons,
         otherTenantExcluded: result ? result.rows[0].revenue === 120 : null, warmRequests: warm.receipt.stats.requests },
       stalePermitRejected,
+      statementGuardrail: statements,
       migration: { decision: migration.decision, affectedAssets: migration.affectedAssets.map(({ id }) => id),
         requiredTestPacks: migration.requiredTestPacks, executed: migration.migrationExecuted },
       triage: { cause: triage.answers?.cause ?? null, symptoms: triage.analysis.symptoms, actionExecuted: triage.actionExecuted },

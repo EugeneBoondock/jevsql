@@ -84,7 +84,12 @@ async function remoteSnapshot(run, dialect, schemaName) {
     if (row.character_maximum_length != null) type += `(${row.character_maximum_length})`;
     else if (['numeric', 'decimal'].includes(type) && row.numeric_precision != null) type += `(${row.numeric_precision},${row.numeric_scale ?? 0})`;
     const pk = constraints.find((c) => c.table_name === row.table_name && c.column_name === row.column_name && c.constraint_type === 'PRIMARY KEY');
-    tables.get(name).columns.push({ name: row.column_name, type, nullable: row.is_nullable === 'YES', defaultValue: row.column_default ?? null, primaryKey: pk ? Number(pk.ordinal_position) : 0 });
+    // ordinal_position is 1-based in information_schema; snapshots are 0-based.
+    // Without it, a reordered catalog would hash identically to the original.
+    const position = Number(row.ordinal_position);
+    if (!Number.isSafeInteger(position) || position < 1) throw new TypeError('Catalog returned an invalid ordinal_position.');
+    tables.get(name).columns.push({ name: row.column_name, type, nullable: row.is_nullable === 'YES',
+      defaultValue: row.column_default ?? null, primaryKey: pk ? Number(pk.ordinal_position) : 0, position: position - 1 });
   }
   for (const row of constraints) {
     const table = tables.get(`${row.table_schema}.${row.table_name}`); if (!table) continue;

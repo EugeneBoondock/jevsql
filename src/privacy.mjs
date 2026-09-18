@@ -33,6 +33,26 @@ export function redactText(text) {
   return PATTERNS.reduce((value, [pattern, replacement]) => value.replace(pattern, replacement), String(text));
 }
 
+/** Question text is authored configuration, but it can still carry caller-supplied
+ * descriptions — runbook summaries, option labels, rubric levels — that reach the
+ * provider and the stored receipt. Redact its string values without touching the
+ * keys, because Choice option labels are part of the answer contract.
+ */
+export function redactQuestions(questions) {
+  let redactions = 0;
+  const walk = (entry) => {
+    if (typeof entry === 'string') {
+      const clean = redactText(entry);
+      if (clean !== entry) redactions++;
+      return clean;
+    }
+    if (Array.isArray(entry)) return entry.map(walk);
+    if (entry && typeof entry === 'object') return Object.fromEntries(Object.entries(entry).map(([key, item]) => [key, walk(item)]));
+    return entry;
+  };
+  return { questions: walk(jsonData(questions)), redactions };
+}
+
 /** Rules-based minimisation, not a guarantee that arbitrary prose contains no PII.
  * allowFields restricts top-level fields before any external request is made.
  */

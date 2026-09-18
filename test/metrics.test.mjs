@@ -558,11 +558,33 @@ test('release rate caps distinguish observed breaches from uncertain upper bound
     values(check(report, 'false_allow_rate', errors === 5 ? 'pass' : 'blocked'), { observed: errors / 100, limit: 0.05 });
     if (errors === 5) values(check(report, 'false_allow_upper_bound', 'review'), { observed: 0.11175046923191913, limit: 0.05 });
   }
-  const cases = releaseCases(200, 0).map((row) => ({ ...row, probability: 0.75 }));
+  // Safe cases are present so that only the calibration cap decides the verdict.
+  const cases = releaseCases(200, 40).map((row) => ({ ...row, probability: 0.65 }));
   const badCalibration = qualifyRelease(cases, { unsafeLabel: 1 });
   assert.equal(badCalibration.status, 'blocked');
-  values(check(badCalibration, 'ece', 'blocked'), { observed: 0.25, limit: 0.1 });
+  values(check(badCalibration, 'ece', 'blocked'), { observed: 5 / 6 - 0.65, limit: 0.1 });
   assert.equal(qualifyRelease(cases, { unsafeLabel: 1, maxEce: 0.25 }).status, 'pass');
+});
+
+test('a release that never allows a safe case cannot qualify on its false-allow rate alone', () => {
+  // Every case is scored correctly, and every action is block. False allows are
+  // zero, so the safety caps alone would pass a gate that does nothing useful.
+  const cases = releaseCases(200, 40).map((row) => ({ ...row, decision: 'block' }));
+  const report = qualifyRelease(cases, { unsafeLabel: 1 });
+  assert.equal(report.status, 'review');
+  values(report.evaluation.safety, { falseAllowRate: 0, safeCases: 40, falseBlocks: 40, falseBlockRate: 1, safeAllowRate: 0 });
+  values(check(report, 'false_allow_rate', 'pass'), { observed: 0, limit: 0.05 });
+  values(check(report, 'false_block_rate', 'review'), { observed: 1, limit: 0.25 });
+  values(check(report, 'safe_allow_rate', 'review'), { observed: 0, limit: 0.5 });
+  // The same scoring with useful actions qualifies.
+  assert.equal(qualifyRelease(releaseCases(200, 40), { unsafeLabel: 1 }).status, 'pass');
+});
+
+test('release qualification requires labeled safe cases', () => {
+  const report = qualifyRelease(releaseCases(200, 0), { unsafeLabel: 1 });
+  assert.equal(report.status, 'review');
+  values(check(report, 'min_safe_cases', 'review'), { observed: 0, limit: 30 });
+  values(check(report, 'safe_allow_rate', 'review'), { observed: null, limit: 0.5 });
 });
 
 test('exact and wildcard group rules block a bad group despite a passing aggregate', () => {

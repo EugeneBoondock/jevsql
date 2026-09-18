@@ -1,7 +1,7 @@
 import { DecisionService } from './decision-service.mjs';
 import { inspectSchema, normalizeSchema, diffSchemas, affectedAssets, pruneSchema } from './schema.mjs';
 import { analyzePlan, summarizeWorkload } from './telemetry.mjs';
-import { inspectQuery, sqlMetadata } from './sql-inspector.mjs';
+import { classifyStatement, inspectQuery, sqlMetadata } from './sql-inspector.mjs';
 import { policyFor, incidentPolicy } from './policies.mjs';
 import { digest } from './privacy.mjs';
 import { integer, probability, stableJson } from './validation.mjs';
@@ -43,6 +43,52 @@ export class DatabaseControl {
     }, { ...options, findings: [...inspection.findings, ...(options.findings ?? [])],
       context: { ...options.context, dialect, schemaVersion: snapshot.hash, sqlHash: digest(sql), paramsHash: digest(params) } });
     return { ...receipt, inspection, executionAllowed: false };
+  }
+
+  /**
+   * Gate one agent-issued statement against its declared intent. Deterministic
+   * classification decides the required approval; the typed answers are evidence
+   * for whoever gives it. Nothing here can execute a statement, and no answer
+   * can raise the approval this returns — a model can only lower eligibility.
+   *
+   * `environment` marks where the statement would run. Anything that is not a
+   * read needs approval, a destructive or unbounded statement needs an
+   * out-of-band human, and production keeps that requirement regardless of how
+   * confidently the statement matches its intent.
+   */
+  async reviewStatement({ statement, intent, dialect = 'sqlite', actor = null,
+    environment = 'unknown', scope = {}, policy = {} }, options = {}) {
+    requiredText(intent, 'Declared intent');
+    const classification = classifyStatement(statement, { dialect });
+    const findings = [];
+    if (classification.statementCount > 1) {
+      findings.push({ level: 'block', code: 'multiple_statements', detail: 'Review one statement at a time; a batch hides its own operations.' });
+    }
+    if (classification.operation === 'unknown') {
+      findings.push({ level: 'review', code: 'unclassified_operation', detail: 'The statement text does not determine an operation class.' });
+    }
+    if (classification.destructive) {
+      findings.push({ level: 'review', code: 'destructive_statement', detail: `The statement ${classification.reasons.join(', ')}.` });
+    }
+    if (classification.unbounded) {
+      findings.push({ level: 'review', code: 'unbounded_write', detail: 'The statement changes state without a WHERE clause or row limit.' });
+    }
+    if (classification.changesPermissions) {
+      findings.push({ level: 'review', code: 'permission_change', detail: 'The statement changes roles, grants or policies.' });
+    }
+    if (classification.operation !== 'read' && environment === 'production') {
+      findings.push({ level: 'review', code: 'production_write', detail: 'A statement that changes production state needs a named human approver.' });
+    }
+    const approval = classification.statementCount > 1 ? 'refused'
+      : classification.destructive || classification.unbounded || classification.changesPermissions ? 'out_of_band_human'
+        : classification.operation === 'read' ? 'none' : 'human';
+    const receipt = await this.service.review(policyFor('statement'), {
+      intent, candidate_statement: classification.sql, parsed_statement: classification,
+      actor, environment, scope, policy,
+    }, { ...options, findings: [...findings, ...(options.findings ?? [])],
+      context: { ...options.context, dialect, environment, statementHash: digest(classification.sql) }, cacheTtlMs: 0 });
+    return { ...receipt, classification, requiredApproval: approval,
+      executionAllowed: false, statementExecuted: false };
   }
 
   async reviewMigration({ before, after, intent, sql = '', assets = [], contracts = {}, policy = {} }, options = {}) {
@@ -158,3 +204,4 @@ export { ReceiptStore } from './receipts.mjs';
 export { GovernedQueries } from './governed-queries.mjs';
 export { SQLiteAdapter, PostgreSQLAdapter, MySQLAdapter } from './adapters.mjs';
 export { POLICY_KINDS, policyFor } from './policies.mjs';
+export { classifyStatement, inspectQuery, sqlMetadata } from './sql-inspector.mjs';

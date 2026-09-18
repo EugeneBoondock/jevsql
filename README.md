@@ -209,6 +209,48 @@ The default cache is in memory. `cacheFile` persists answers between processes; 
 
 Decision receipts include hashes, question details, criteria, the requested and returned model, timestamps, and cache/API provenance. They are query-level receipts, not per-cell explanations or a model reasoning transcript. Saved runs retain these receipts beside the before/after row history.
 
+## The database control plane
+
+The library has two separate paths with different guarantees. Keep them apart when you reason about safety.
+
+**The row-decision engine** (`JevSQL`) is the SQLite middleware described above. It runs your SQL, so it needs a database it is allowed to read. Its default model is the moving `jev-latest` alias; pass `model: 'jev-1.13.0'` to pin it.
+
+**The control plane** (`jevsql/control`) never executes arbitrary SQL. It reviews database events and returns typed receipts. It requires a pinned model version by default and refuses `jev-latest`. Only `GovernedQueries` can reach a database, and only through a registered template compiled by code.
+
+```bash
+node bin/jevsql.mjs control --help
+```
+
+| Workflow | What it does | What it cannot do |
+|---|---|---|
+| `reviewStatement` | Classifies an agent-issued statement deterministically, then adds typed judgement on intent match, blast radius and shared-data reach | Execute anything. A read that matches its intent is `eligible`; every write needs approval, and a destructive or unbounded statement needs an out-of-band human |
+| `reviewQuery` | Reviews proposed SQL for intent, grain, scope, tenant and field-use risk, with SQLite compilation when a local database is supplied | Grant execution. External-dialect SQL is advisory only |
+| `reviewMigration` | Diffs two schema snapshots, resolves affected consumers, and returns required test packs as review evidence | Apply, test, or roll back a migration |
+| `triagePlan` / `triageIncident` | Measures an EXPLAIN plan in code, then classifies the cause or selects an approved runbook | Run a remediation |
+| `selectSchema` | Prunes a schema to the tables a request needs, keeping foreign-key bridges | Guarantee the pruned schema is sufficient |
+| `GovernedQueries` | Routes a request to a registered template, compiles bound SQL, and issues a single-use execution permit | Accept SQL fragments, model-supplied values, or a changed actor, template or schema after review |
+
+Arithmetic, dates, permissions and execution stay in code throughout. A typed answer decides *eligibility*; it never decides *authorization*.
+
+### Tenant scope must be declared
+
+When an actor carries a `tenantId`, every table a template touches must be classified, or compilation fails:
+
+```js
+new GovernedQueries({ service, adapter, templates, tenantColumns: {
+  invoices: 'account_id', // tenant-owned, filtered by the authenticated tenant
+  currencies: null,       // explicitly shared reference data
+} });
+```
+
+A table with a `tenant_id` column is recognised automatically, whatever its letter case. Anything else is an error rather than a silently unfiltered query. This is a compiler guardrail, not a substitute for row-level security in the database itself.
+
+### Measuring before you trust a threshold
+
+`jevsql/metrics` evaluates labeled cases: confusion matrices, Brier score, expected calibration error, reliability bins, Wilson intervals, and per-group breakdowns by dialect, schema version, template version and model.
+
+`qualifyRelease` enforces a release policy on a declared holdout split. It checks safety *and* usefulness: a policy that blocks every case has no false allows and still cannot pass, because `falseBlockRate` and `safeAllowRate` are checked on the safe cases. Passing is evidence about the supplied sample, not proof of future accuracy.
+
 ## Data and operating boundaries
 
 Only pass data that may be sent to TypeSafe. Cache labels, selection criteria, saved query parameters, decision tables, and change history may contain sensitive values. Source text is not separately retained in query receipts, but selected spans and rubric labels can reveal it. Protect database and cache files accordingly.
@@ -217,11 +259,13 @@ This is a SQLite middleware library, not a PostgreSQL or DuckDB extension. It ma
 
 The collect rewrite is a conservative SQL text transform, not a full SQL optimizer. Alias ordering, quoted function names, parameters, ordinary joins, comments, and common predicates have regression coverage. Complex nested queries, windows, volatile SQL expressions, and many dependent model calls need workload-specific testing; unresolved work fails after a bounded number of rounds.
 
+To discover which judgments a query needs, the collect pass stops judgment predicates from filtering, including inside nested groups, so a predicate such as `(tenant_id = 1 AND jev_bool(...))` keeps filtering on the tenant. A clause it cannot split that way — a top-level `OR`, `BETWEEN` or `CASE` — is relaxed whole, which means rows the query excludes are still sent for judgment. Those rows never reach the caller, but they do leave the process. `stats.widened` names any clause this happened to, and `strictCollect: true` refuses such a query instead. Put an authorization predicate in a subquery or CTE rather than relying on the rewrite.
+
 Keep arithmetic, date comparisons, access control, and actual writes in code. Jev’s own [known limitations](https://docs.typesafe.ai/model-jaggedness/jev-1.13) include numeric precision, indirect questions, distracting state, and adversarial text. The passage example includes an advisory suspicious-content signal; it is not a security boundary.
 
 ## Recipes, research, and validation
 
-[The workflow tour](examples/workflows.mjs) runs the [SQL recipes](examples/recipes): evidence audit, review queue, source extraction, entity matching, passage ranking, and data checks. [Research notes](docs/jev-research.md) record the documentation findings and design choices. [Validation notes](docs/validation.md) distinguish fixture checks from the live synthetic run.
+[The workflow tour](examples/workflows.mjs) runs the [SQL recipes](examples/recipes): evidence audit, review queue, source extraction, entity matching, passage ranking, and data checks. [Research notes](docs/jev-research.md) record the documentation findings and design choices. [Validation notes](docs/validation.md) distinguish fixture checks from the live synthetic run. The [implementation audit](docs/implementation-audit-2026-09-19.md) records what is verified, what was repaired, and what is still unproven — including the evaluation evidence this project does not yet have.
 
 ```bash
 npm test

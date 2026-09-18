@@ -1,5 +1,10 @@
 # JevSQL implementation audit
 
+> **Superseded.** This records the state before remediation. Every defect below
+> (F1-F8) and the coverage gaps that follow them are fixed; see
+> [implementation-audit-2026-09-19.md](implementation-audit-2026-09-19.md) for the
+> fixes, their regression tests, and what remains genuinely open.
+
 Date: 18 September 2026. Scope: the current local project, including its existing local changes, compared with the three supplied research PDFs.
 
 ## Finding

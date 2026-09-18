@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { JevClient, USD_PER_INPUT_TOKEN } from './client.mjs';
 import { JudgmentCache } from './cache.mjs';
 import { integer, nonNegative, probability, validateAnswer } from './validation.mjs';
-import { digest, jsonData, redactState } from './privacy.mjs';
+import { digest, jsonData, redactQuestions, redactState } from './privacy.mjs';
 
 const bytes = (value) => Buffer.byteLength(JSON.stringify(value), 'utf8');
 const text = (value, name) => {
@@ -96,7 +96,11 @@ export class DecisionService {
   async review(inputPolicy, inputState, { context = {}, findings = [], dryRun = false, signal, includeEvidence = false, cacheTtlMs = this.cacheTtlMs } = {}) {
     if (this.#closed) throw new Error('Decision service is closed.');
     signal?.throwIfAborted();
-    const policy = definePolicy(inputPolicy);
+    // Questions travel to the provider and into the receipt exactly like state,
+    // so they are minimised on the same path before anything is hashed or sent.
+    const declared = definePolicy(inputPolicy);
+    const { questions, redactions: questionRedactions } = redactQuestions(declared.questions);
+    const policy = { ...declared, questions };
     const safeContext = redactState(context, { privateFields: this.privacy.privateFields ?? [] }).state;
     const safeFindings = redactState(findings, { privateFields: this.privacy.privateFields ?? [] }).state;
     if (!Array.isArray(safeFindings) || safeFindings.some((item) => !item || !['info', 'review', 'block'].includes(item.level) || typeof item.code !== 'string')) {
@@ -114,7 +118,8 @@ export class DecisionService {
       stats.wallMs = Math.round(performance.now() - started);
       const receipt = { id: randomUUID(), kind: policy.id, policyVersion: policy.version, policyHash,
         requestedModel: this.model, resolvedModel: resolvedModel ?? null, stateHash, context: safeContext,
-        createdAt, source, ...outcome, answers, findings: safeFindings, privacy: { redactions, omittedFields }, stats,
+        createdAt, source, ...outcome, answers, findings: safeFindings,
+        privacy: { redactions: redactions + questionRedactions, questionRedactions, omittedFields }, stats,
         ...(includeEvidence ? { evidence: state, questions: policy.questions } : {}) };
       if (this.store) await this.store.append(receipt);
       return receipt;

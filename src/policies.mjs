@@ -6,7 +6,36 @@ const choice = (question, criteria) => ({ type: 'choice', instructions: question
 const severity = { type: 'score', instructions: 'Judge business impact from supplied symptoms and context, without calculating quantities.',
   criteria: ['No demonstrated business disruption', 'A limited workflow needs attention', 'A customer workflow is failing', 'Many customer workflows are blocked'] };
 
+const blastRadius = { type: 'score', instructions: 'Judge how much of the documented system this statement could affect, using the supplied scope evidence only. Do not estimate row counts; use the supplied buckets.',
+  criteria: ['A single identified record or a private scratch object', 'One bounded set inside one documented feature',
+    'A whole table, tenant or shared reference object', 'Multiple tables, every tenant, or the schema itself'] };
+
 const DEFINITIONS = {
+  // The typed guardrail in front of an agent-issued statement. Deterministic code
+  // classifies the operation and owns the gate; these questions add the semantic
+  // judgement a keyword parser cannot make, and never grant execution.
+  statement: { questions: {
+    matches_intent: noul('Does the statement do what its declared intent says, and nothing further? Compare the parsed operation, targets and filters against the intent.'),
+    destructive: noul('Would this statement permanently remove or overwrite recorded data or a schema object that the supplied evidence does not show is reproducible?'),
+    reversible: noul('Does the supplied evidence show an approved way to restore the previous state after this statement?'),
+    affects_shared_data: noul('Does this statement reach records or objects the supplied evidence attributes to other tenants, teams or consumers?'),
+    unexpected_for_actor: noul('Does this statement fall outside the documented purpose of the supplied actor or role?'),
+    operation_class: choice('Which operation class best describes the statement, according to its parsed metadata?', {
+      read: 'Returns records without changing stored state', insert: 'Adds records',
+      update: 'Changes existing records', delete: 'Removes records',
+      schema: 'Changes tables, columns, indexes, views or other definitions',
+      permission: 'Changes roles, grants or security policies',
+      maintenance: 'Operational work such as vacuum, analyze, reindex or checkpoint',
+      unknown: 'The supplied metadata does not determine a class',
+    }),
+    blast_radius: blastRadius,
+  },
+  // Only a read that matches its stated intent can be eligible. Anything that
+  // changes state fails the operation_class gate and has to be approved, which
+  // is the read-only-auto-run boundary the documents ask for.
+  accept: [{ question: 'matches_intent', min: 0.95 }, { question: 'destructive', max: 0.05 },
+    { question: 'affects_shared_data', max: 0.05 }, { question: 'unexpected_for_actor', max: 0.05 },
+    { question: 'operation_class', equals: 'read', minConfidence: 0.9 }] },
   query: { questions: {
     intent_match: noul('Does the candidate query answer the requested metric, population, aggregation grain, time basis and filters, according to the schema?'),
     overscoped: noul('Does the candidate request broader records, fields or business purposes than requested?'),
@@ -81,6 +110,37 @@ const DEFINITIONS = {
     purpose_match: noul('Does the stated access purpose fit the documented role and data domain? This signal cannot grant permissions.'),
     excessive_scope: noul('Does the request extend beyond the documented role purpose?'),
     sensitive_purpose: noul('Does the requested purpose involve a sensitive use absent from the supplied policy?'),
+  } },
+  // Counting repeated queries is deterministic; naming the modelling fault is not.
+  orm: { questions: {
+    class: choice('Which access-pattern fault best explains the supplied, already-counted query evidence?', {
+      n_plus_one: 'A per-record query repeats instead of one set-based read', over_fetching: 'Far more columns or rows are read than the operation uses',
+      missing_batching: 'Independent reads that could be issued once are issued separately', chatty_write: 'A write path repeats single-row statements',
+      lazy_loading: 'A relationship is resolved on access rather than being loaded with its parent',
+      expected_pattern: 'The repetition matches the documented behaviour of this operation', unknown: 'Insufficient evidence',
+    }),
+    model_mismatch: noul('Does the supplied model definition contradict the schema constraints it maps to, such as optionality, uniqueness or relationship direction?'),
+    fix_is_local: noul('Do the supplied traces show that the change is contained in one documented operation, rather than requiring a wider redesign?'),
+  } },
+  // Cost arithmetic stays upstream; the judgement is which spend means the same thing.
+  cost: { questions: {
+    redundant: noul('Do the supplied workloads compute the same business measure as another workload in the evidence?'),
+    purpose: choice('Which business purpose best describes this measured workload?', {
+      customer_facing: 'Serves an interactive customer or partner request', internal_reporting: 'Produces internal reports or dashboards',
+      pipeline: 'Scheduled loading, transformation or export', maintenance: 'Operational upkeep of the database itself',
+      experiment: 'Exploration, backfill or one-off analysis', unknown: 'Insufficient evidence',
+    }),
+    safe_to_reduce: noul('Does the supplied evidence describe this workload as having no documented consumer that requires its current frequency or scope?'),
+  } },
+  // Regexes find obvious tokens; this judges the ambiguous remainder.
+  secrets: { questions: {
+    credential_like: noul('Does the supplied fragment contain a value that appears to be a live credential, key or token, rather than a placeholder, example or identifier?'),
+    family: choice('Which secret family does the supplied fragment most resemble?', {
+      password: 'A password or passphrase', api_key: 'An API or service key', token: 'A session, bearer or refresh token',
+      private_key: 'A private key or certificate material', connection_string: 'A connection string embedding credentials',
+      none: 'No secret material is present', unknown: 'Insufficient evidence',
+    }),
+    placeholder: noul('Is the supplied value clearly a placeholder, redaction marker, test fixture or documentation example?'),
   } },
   realism: { questions: {
     plausible: noul('Do the synthetic records describe a plausible business scenario given their already-verified constraints and date relationships?'),

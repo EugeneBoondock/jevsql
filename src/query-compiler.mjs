@@ -78,7 +78,14 @@ export function compileTemplate(input, schema, { params = {}, actor, tenantColum
   }
   if (!Array.isArray(schema.tables)) throw new TypeError('A schema snapshot with tables is required.');
   const available = new Map(schema.tables.map((table) => [table.name, table]));
-  const used = new Map(), values = [], consumed = new Set(), tenantScopedTables = new Set();
+  const used = new Map(), values = [], consumed = new Set(), tenantScopedTables = new Set(), sharedTables = new Set();
+  const caseless = schema.identifierCase ? schema.identifierCase === 'insensitive' : dialect === 'sqlite';
+  const key = (value) => caseless ? String(value).toLowerCase() : String(value);
+  for (const [table, column] of Object.entries(tenantColumns)) {
+    if (column !== null && (typeof column !== 'string' || !column.trim())) {
+      throw new TypeError(`tenantColumns.${table} must be a column name, or null to declare the table shared.`);
+    }
+  }
   const quote = (name) => quoteName(name, dialect);
   const relation = (name) => dialect === 'sqlite' ? quote(name) : name.split('.').map(quote).join('.');
   const bind = (value) => {
@@ -111,10 +118,24 @@ export function compileTemplate(input, schema, { params = {}, actor, tenantColum
     if (!table?.columns.some((item) => item.name === column)) throw new Error(`Unknown column ${name}.${column}.`);
     return { table, column, key: `${name}.${column}`, sql: `${quote(table.alias)}.${quote(column)}` };
   };
+  // Every table a tenant-scoped actor touches must be classified, because an
+  // unrecognised tenant column silently produces a query with no tenant
+  // predicate while the review evidence still describes an enforced scope.
+  // A classification is a column name, or an explicit null meaning shared.
+  const classify = (table) => {
+    const mapped = Object.keys(tenantColumns).find((name) => key(name) === key(table.name));
+    if (mapped !== undefined) return tenantColumns[mapped];
+    if (table.tenantColumn !== undefined) return table.tenantColumn;
+    const column = table.columns.find((entry) => key(entry.name) === 'tenant_id');
+    return column ? column.name : undefined;
+  };
   const tenantPredicate = (table) => {
-    const column = (Object.hasOwn(tenantColumns, table.name) ? tenantColumns[table.name] : null)
-      ?? table.tenantColumn ?? (table.columns.some((c) => c.name === 'tenant_id') ? 'tenant_id' : null);
-    if (!column) return null;
+    const column = classify(table);
+    if (column === undefined) {
+      if (identity.tenantId == null) return null;
+      throw new Error(`Table ${table.name} has no tenant classification. Map it to its tenant column, or to null to declare it shared.`);
+    }
+    if (column === null) { sharedTables.add(table.name); return null; }
     if (identity.tenantId == null || identity.tenantId === '') throw new Error('This template needs an authenticated tenant scope.');
     tenantScopedTables.add(table.name);
     return `${resolve({ table: table.name, column }).sql} = ${bind(identity.tenantId)}`;
@@ -137,7 +158,19 @@ export function compileTemplate(input, schema, { params = {}, actor, tenantColum
       || (next.foreignKeys ?? []).some((fk) => fk.referenceTable === leftTable.name && same(fk.columns, rightCols) && same(fk.referenceColumns, leftCols));
     if (!declared) throw new Error('Joins must follow a declared foreign-key relationship.');
     const primary = next.columns.filter((column) => column.primaryKey).sort((a, b) => Number(a.primaryKey) - Number(b.primaryKey)).map((column) => column.name);
-    const unique = same(primary, rightCols) || (next.indexes ?? []).some((index) => index.unique && !index.partial && same(index.columns, rightCols));
+    // A uniqueness guarantee only holds under the collation that enforces it.
+    // SQLite compares with the left operand's collation, falling back to the
+    // right's, so a NOCASE key joined to a BINARY UNIQUE column can still match
+    // several rows and multiply an aggregate. Prove the collations agree or
+    // treat the join as multiplicative.
+    const collationOf = (value) => (value ?? 'BINARY').toUpperCase();
+    const columnOf = (table, column) => table.columns.find((entry) => entry.name === column);
+    const comparisonCollations = resolved.map(([left, right]) =>
+      collationOf(columnOf(left.table, left.column)?.collation ?? columnOf(next, right.column)?.collation));
+    const matches = (enforced) => enforced.every((collation, i) => collation === comparisonCollations[i]);
+    const unique = (same(primary, rightCols) && matches(rightCols.map((column) => collationOf(columnOf(next, column)?.collation))))
+      || (next.indexes ?? []).some((index) => index.unique && !index.partial && same(index.columns, rightCols)
+        && matches(rightCols.map((column, i) => collationOf(index.terms?.[i]?.collation ?? columnOf(next, column)?.collation))));
     if (!unique) multiplicative.push(next.name);
     const kind = (join.type ?? 'inner').toLowerCase();
     if (!['inner', 'left'].includes(kind)) throw new Error('Only explicit inner and left joins are supported.');
@@ -203,7 +236,8 @@ export function compileTemplate(input, schema, { params = {}, actor, tenantColum
     + (groups.length ? ` GROUP BY ${groups.map((group) => group.sql).join(', ')}` : '')
     + (order.length ? ` ORDER BY ${order.join(', ')}` : '') + ` LIMIT ${bind(limit)}`;
   const result = { sql, values: Object.freeze(values), dialect, maxRows: limit, columns: Object.freeze(query.select.map((entry) => entry.as)),
-    tables: [...used.keys()], tenantScopedTables: Object.freeze([...tenantScopedTables]), templateId: template.id, templateVersion: template.version,
+    tables: [...used.keys()], tenantScopedTables: Object.freeze([...tenantScopedTables]),
+    sharedTables: Object.freeze([...sharedTables]), templateId: template.id, templateVersion: template.version,
     templateHash: digest(template), schemaHash: schema.hash ?? digest(schema), actorHash: digest(identity), paramsHash: digest(params) };
   Object.freeze(result.tables); Object.freeze(result); COMPILED.add(result);
   return result;

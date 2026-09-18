@@ -15,6 +15,7 @@ USAGE
   jevsql control schema --db data.db          inspect schema without reading records
   jevsql control drift change.json            deterministic contract diff and impact
   jevsql control migration change.json        migration review packet and test packs
+  jevsql control statement statement.json     gate one agent statement against its declared intent
   jevsql control query-review query.json      review proposed SQL; --db for SQLite compilation
   jevsql control review event.json            typed domain review or supplied custom policy
   jevsql control select-schema request.json   select relevant tables and retain FK bridges
@@ -129,7 +130,7 @@ export async function controlMain(argv) {
     else output(compareEvaluations(input.baseline, input.candidate));
     return;
   }
-  const supported = ['schema', 'migration', 'query-review', 'review', 'select-schema', 'triage', 'route', 'run', 'compare'];
+  const supported = ['schema', 'migration', 'statement', 'query-review', 'review', 'select-schema', 'triage', 'route', 'run', 'compare'];
   if (!supported.includes(command)) throw new Error(`Unknown control command ${command}. Use --help.`);
   if (['schema', 'route', 'run', 'compare'].includes(command) && !opts.db) throw new Error('This command needs --db <existing file>.');
   if (opts.db && !existsSync(opts.db)) throw new Error('The database file does not exist.');
@@ -146,6 +147,7 @@ export async function controlMain(argv) {
       cache: new JudgmentCache(opts.cache ?? null), store });
     const control = new DatabaseControl({ engine, service }), options = { dryRun: Boolean(opts.dryRun) };
     if (command === 'migration') output(await control.reviewMigration(input, options));
+    else if (command === 'statement') output(await control.reviewStatement(input, options));
     else if (command === 'query-review') output(await control.reviewQuery(input, options));
     else if (command === 'select-schema') output(await control.selectSchema(input, options));
     else if (command === 'triage') output(input.runbooks ? await control.triageIncident(input, options) : await control.triagePlan(input, options));

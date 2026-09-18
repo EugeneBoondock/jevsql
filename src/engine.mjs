@@ -32,7 +32,7 @@ export class JevSQL {
    * @param {number} [options.maxJudgments] refuse to spend more than this per query
    */
   constructor({ db = ':memory:', cacheFile = null, maxJudgments = 1000, client, cache, limits = {}, maxRounds = 8,
-    concurrency = 4, maxEstimatedCostUsd = null, cacheNamespace = '', ...clientOptions } = {}) {
+    concurrency = 4, maxEstimatedCostUsd = null, cacheNamespace = '', strictCollect = false, ...clientOptions } = {}) {
     integer(maxJudgments, 'maxJudgments', 0);
     integer(maxRounds, 'maxRounds');
     integer(concurrency, 'concurrency', 1, 32);
@@ -50,6 +50,7 @@ export class JevSQL {
     this.concurrency = concurrency;
     this.maxEstimatedCostUsd = maxEstimatedCostUsd;
     this.cacheNamespace = cacheNamespace;
+    this.strictCollect = Boolean(strictCollect);
 
     this.#pending = new Map();  // key -> judgment, waiting to be resolved
     this.#resolved = new Map(); // key -> answer, for this process
@@ -131,10 +132,20 @@ export class JevSQL {
     signal?.throwIfAborted();
     this.#signal = signal; this.#audit = audit; this.#trace = new Map();
     const started = performance.now();
-    const stats = { rounds: 0, judgments: 0, cacheHits: 0, requests: 0, inputTokens: 0, costUsd: 0, relaxed: [], apiMs: 0, estimatedCostUsd: 0, model: this.model };
+    const stats = { rounds: 0, judgments: 0, cacheHits: 0, requests: 0, inputTokens: 0, costUsd: 0, relaxed: [], widened: [], apiMs: 0, estimatedCostUsd: 0, model: this.model };
 
-    const { sql: collectSql, relaxed } = relaxForCollect(sql);
+    const { sql: collectSql, relaxed, widened } = relaxForCollect(sql);
     stats.relaxed = relaxed;
+    stats.widened = widened;
+    // Widening only affects which rows are judged, never which rows are returned.
+    // It still decides which rows leave the process, so a query carrying an
+    // authorization predicate should refuse rather than collect beyond it.
+    if (widened.length && this.strictCollect) {
+      throw new Error(
+        `JevSQL refused this query: the ${widened.join(' and ')} clause cannot be relaxed without also widening a condition that is not a judgment, `
+        + 'so rows the query excludes would be sent for judgment. Filter the authorized rows in a subquery or CTE, or set strictCollect: false.',
+      );
+    }
     this.#served = 0;
     this.#seen = new Set();
     this.#fetched = new Set();

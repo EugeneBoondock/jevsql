@@ -62,8 +62,15 @@ export function validateAnswer(answer, question) {
   let sum = 0;
   for (const label of labels) sum += probability(probabilities[label], `probabilities[${label}]`);
   if (Math.abs(sum - 1) > 0.02) throw new Error('Answer probabilities must sum to 1.');
-  if (question.kind === 'choice' && !labels.includes(answer.choice)) {
-    throw new Error('Answer choice is outside the supplied options.');
+  if (question.kind === 'choice') {
+    if (!labels.includes(answer.choice)) throw new Error('Answer choice is outside the supplied options.');
+    // TypeSafe defines Choice as the highest-probability option. A response whose
+    // selected option is not an argmax is internally contradictory, so it must not
+    // be able to satisfy a confidence gate. Ties are allowed within tolerance.
+    const best = labels.reduce((max, label) => Math.max(max, probabilities[label]), -Infinity);
+    if (probabilities[answer.choice] < best - 0.02) {
+      throw new Error('Answer choice is not the highest-probability option.');
+    }
   }
   if (question.kind === 'score' && (typeof answer.score !== 'number'
       || !Number.isFinite(answer.score) || answer.score < 0 || answer.score > labels.length - 1)) {

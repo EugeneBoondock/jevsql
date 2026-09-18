@@ -19,8 +19,34 @@ export class ReceiptStore {
         reviewer TEXT NOT NULL, label TEXT NOT NULL, reason TEXT NOT NULL,
         created_at TEXT NOT NULL, UNIQUE(receipt_id, revision)
       );
+      CREATE TABLE IF NOT EXISTS _jevsql_chain (
+        sequence INTEGER PRIMARY KEY, kind TEXT NOT NULL, ref_id TEXT NOT NULL,
+        payload TEXT NOT NULL, previous_hash TEXT NOT NULL, hash TEXT NOT NULL,
+        UNIQUE(kind, ref_id)
+      );
       CREATE INDEX IF NOT EXISTS _jevsql_receipt_queue ON _jevsql_receipts(decision, sequence);
     `);
+    // A store written before the chain existed keeps its receipt hashes: they use
+    // the same formula, so an archived head hash stays valid after the backfill.
+    if (!this.db.prepare('SELECT 1 FROM _jevsql_chain LIMIT 1').get()) {
+      const insert = this.db.prepare('INSERT INTO _jevsql_chain(kind,ref_id,payload,previous_hash,hash) VALUES (?,?,?,?,?)');
+      this.db.exec('BEGIN IMMEDIATE');
+      try {
+        for (const row of this.db.prepare('SELECT * FROM _jevsql_receipts ORDER BY sequence').all()) {
+          insert.run('receipt', row.id, row.payload, row.previous_hash, row.hash);
+        }
+        this.db.exec('COMMIT');
+      } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+    }
+  }
+
+  /** Append one entry to the single integrity log. Callers hold the transaction. */
+  #chain(kind, refId, payload) {
+    const previous = this.db.prepare('SELECT hash FROM _jevsql_chain ORDER BY sequence DESC LIMIT 1').get()?.hash ?? '';
+    const hash = digest([previous, payload]);
+    this.db.prepare('INSERT INTO _jevsql_chain(kind,ref_id,payload,previous_hash,hash) VALUES (?,?,?,?,?)')
+      .run(kind, refId, payload, previous, hash);
+    return { previous, hash };
   }
 
   append(receipt) {
@@ -34,9 +60,9 @@ export class ReceiptStore {
       if (existing) {
         if (existing.payload !== payload) throw new Error('Receipt id already refers to different evidence.');
       } else {
-        const previous = this.db.prepare('SELECT hash FROM _jevsql_receipts ORDER BY sequence DESC LIMIT 1').get()?.hash ?? '';
+        const { previous, hash } = this.#chain('receipt', receipt.id, payload);
         this.db.prepare('INSERT INTO _jevsql_receipts(id,decision,created_at,payload,previous_hash,hash) VALUES (?,?,?,?,?,?)')
-          .run(receipt.id, receipt.decision, receipt.createdAt, payload, previous, digest([previous, payload]));
+          .run(receipt.id, receipt.decision, receipt.createdAt, payload, previous, hash);
       }
       this.db.exec('COMMIT');
       return receipt;
@@ -75,6 +101,9 @@ export class ReceiptStore {
       if (revision !== expectedRevision) throw new Error('Feedback changed. Read its latest revision before replacing a label.');
       const result = { id: randomUUID(), receiptId, revision: revision + 1, reviewer: redactText(reviewer), label,
         reason: redactText(reason), createdAt: new Date().toISOString() };
+      // A human label decides what a receipt meant, so it belongs in the same
+      // integrity log; otherwise a later edit to it leaves verify() reporting ok.
+      this.#chain('feedback', result.id, stableJson(result));
       this.db.prepare('INSERT INTO _jevsql_feedback VALUES (?,?,?,?,?,?,?)')
         .run(result.id, receiptId, result.revision, result.reviewer, JSON.stringify(label), result.reason, result.createdAt);
       this.db.exec('COMMIT'); return result;
@@ -87,16 +116,36 @@ export class ReceiptStore {
         label: JSON.parse(row.label), reason: row.reason, createdAt: row.created_at }));
   }
 
-  /** Detect local edits/deletions; archive the returned head hash elsewhere to anchor it. */
+  /** Detect local edits, deletions and insertions across receipts and human
+   * labels; archive the returned head hash elsewhere to anchor it. */
   verify() {
-    let previous = '', count = 0;
-    for (const row of this.db.prepare('SELECT * FROM _jevsql_receipts ORDER BY sequence').iterate()) {
+    let previous = '', count = 0, feedbackCount = 0;
+    const seen = { receipt: new Set(), feedback: new Set() };
+    for (const row of this.db.prepare('SELECT * FROM _jevsql_chain ORDER BY sequence').iterate()) {
       if (row.previous_hash !== previous || digest([previous, row.payload]) !== row.hash) return { ok: false, sequence: row.sequence };
-      const receipt = JSON.parse(row.payload);
-      if (receipt.id !== row.id || receipt.decision !== row.decision || receipt.createdAt !== row.created_at) return { ok: false, sequence: row.sequence };
-      previous = row.hash; count++;
+      if (row.kind === 'receipt') {
+        const stored = this.db.prepare('SELECT * FROM _jevsql_receipts WHERE id=?').get(row.ref_id);
+        const receipt = JSON.parse(row.payload);
+        if (!stored || stored.payload !== row.payload || receipt.id !== row.ref_id
+          || stored.decision !== receipt.decision || stored.created_at !== receipt.createdAt) return { ok: false, sequence: row.sequence };
+        count++;
+      } else if (row.kind === 'feedback') {
+        const stored = this.db.prepare('SELECT * FROM _jevsql_feedback WHERE id=?').get(row.ref_id);
+        if (!stored || stableJson({ id: stored.id, receiptId: stored.receipt_id, revision: stored.revision,
+          reviewer: stored.reviewer, label: JSON.parse(stored.label), reason: stored.reason,
+          createdAt: stored.created_at }) !== row.payload) return { ok: false, sequence: row.sequence };
+        feedbackCount++;
+      } else return { ok: false, sequence: row.sequence };
+      seen[row.kind].add(row.ref_id);
+      previous = row.hash;
     }
-    return { ok: true, count, head: previous };
+    // Rows appended straight to a table, bypassing the log, are also tampering.
+    for (const [kind, table] of [['receipt', '_jevsql_receipts'], ['feedback', '_jevsql_feedback']]) {
+      for (const row of this.db.prepare(`SELECT id FROM ${table}`).iterate()) {
+        if (!seen[kind].has(row.id)) return { ok: false, sequence: null, unlogged: { kind, id: row.id } };
+      }
+    }
+    return { ok: true, count, feedbackCount, entries: count + feedbackCount, head: previous };
   }
 
   close() { this.db.close(); }

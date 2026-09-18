@@ -45,23 +45,56 @@ function findTopLevelKeyword(upperSql, keyword, from = 0) {
 // which is why 1=1 is used here (see the guard test in test/unit.test.mjs).
 const alwaysTrue = (part) => ` (${part.trim()}${part.includes('--') ? '\n' : ''} OR 1=1) `;
 
-function relaxClause(body) {
+/** The inner body when a fragment is exactly one parenthesised group, else null. */
+function unwrapGroup(part) {
+  const trimmed = part.trim();
+  if (!trimmed.startsWith('(') || !trimmed.endsWith(')')) return null;
+  const masked = maskSql(trimmed);
+  let depth = 0;
+  for (let i = 0; i < masked.length; i++) {
+    if (masked[i] === '(') depth++;
+    else if (masked[i] === ')' && --depth === 0) return i === masked.length - 1 ? trimmed.slice(1, -1) : null;
+  }
+  return null;
+}
+
+/**
+ * @returns {{sql: string, widened: boolean}} widened marks a clause where a
+ * condition that was not a judgment also stopped filtering. Those rows still do
+ * not reach the caller — the real statement runs again — but they do reach the
+ * model during collection, so an authorization predicate must not be in one.
+ */
+function relaxClause(body, depth = 0) {
   const words = topLevelWords(body);
   // OR precedence, CASE branches, and BETWEEN bounds cannot be split as AND chains.
-  if (words.some(({ word }) => ['OR', 'BETWEEN', 'CASE'].includes(word))) return alwaysTrue(body);
+  if (words.some(({ word }) => ['OR', 'BETWEEN', 'CASE'].includes(word))) return { sql: alwaysTrue(body), widened: true };
   const conjuncts = [], separators = words.filter(({ word }) => word === 'AND');
   let start = 0;
   for (const separator of separators) { conjuncts.push(body.slice(start, separator.start)); start = separator.end; }
   conjuncts.push(body.slice(start));
-  return conjuncts.map((part) => (mentionsJev(part) ? alwaysTrue(part) : part)).join(' AND ');
+  let widened = false;
+  const parts = conjuncts.map((part) => {
+    if (!mentionsJev(part)) return part;
+    // A grouped conjunction is still a conjunction. Descend into it so that
+    // `(tenant_id = 1 AND jev_bool(...))` keeps filtering on the tenant instead
+    // of relaxing the whole group and collecting every tenant's rows.
+    const inner = depth < 16 ? unwrapGroup(part) : null;
+    if (inner === null) return alwaysTrue(part);
+    const nested = relaxClause(inner, depth + 1);
+    widened ||= nested.widened;
+    return ` (${nested.sql}) `;
+  });
+  return { sql: parts.join(' AND '), widened };
 }
 
 /**
  * Rewrite a statement for a collect pass.
- * @returns {{sql: string, relaxed: string[]}} relaxed lists what was loosened
+ * @returns {{sql: string, relaxed: string[], widened: string[]}} relaxed lists
+ * what was loosened; widened lists clauses where a non-judgment condition also
+ * stopped filtering, so more rows than the query returns were sent for judgment.
  */
 export function relaxForCollect(sql) {
-  const relaxed = [];
+  const relaxed = [], widened = [];
   let out = sql;
 
   for (const [keyword, stops] of [
@@ -71,8 +104,9 @@ export function relaxForCollect(sql) {
     const span = clauseSpan(out, keyword, stops);
     if (!span || !mentionsJev(span.body)) continue;
     const replacement = relaxClause(span.body);
-    out = out.slice(0, span.start) + keyword + replacement + out.slice(span.end);
+    out = out.slice(0, span.start) + keyword + replacement.sql + out.slice(span.end);
     relaxed.push(keyword);
+    if (replacement.widened) widened.push(keyword);
   }
 
   // A LIMIT on top of a jev-driven ORDER BY would truncate before the ordering is known.
@@ -84,5 +118,5 @@ export function relaxForCollect(sql) {
     if (limit) { out = out.slice(0, limit.start).trimEnd(); relaxed.push('LIMIT'); }
   }
 
-  return { sql: out, relaxed };
+  return { sql: out, relaxed, widened };
 }
