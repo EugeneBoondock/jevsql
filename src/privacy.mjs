@@ -19,7 +19,27 @@ export function jsonData(value, depth = 0, seen = new Set()) {
 }
 
 const PRIVATE_FIELD = /^(?:password|passwd|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|cookie|ssn|email|phone|credit[_-]?card|private[_-]?key)$/i;
+
+/** Luhn check, so a long order number is not mistaken for a card. */
+function luhn(digits) {
+  let sum = 0, double = false;
+  for (let i = digits.length - 1; i >= 0; i--) {
+    let value = digits.charCodeAt(i) - 48;
+    if (double) { value *= 2; if (value > 9) value -= 9; }
+    sum += value;
+    double = !double;
+  }
+  return sum % 10 === 0;
+}
+
 const PATTERNS = [
+  // A primary account number is the one value most worth never sending. Spaces
+  // and dashes are common in pasted text, and the Luhn check keeps invoice and
+  // order numbers of the same length intact.
+  [/\b\d(?:[ -]?\d){12,18}\b/g, (match) => {
+    const digits = match.replace(/\D/g, '');
+    return digits.length >= 13 && digits.length <= 19 && luhn(digits) ? '[card removed]' : match;
+  }],
   [/-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----/g, '[private key removed]'],
   [/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [removed]'],
   [/\b(?:sk-(?:proj-)?|AKIA)[A-Za-z0-9_-]{12,}\b/g, '[key removed]'],

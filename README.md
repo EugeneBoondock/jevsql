@@ -21,22 +21,51 @@ JevSQL adds TypeSafe Jev judgments to SQLite. It can compare records by meaning,
 ## What breaks without it
 
 ```bash
-node examples/contrast.mjs
+node examples/contrast.mjs            # 31 comparisons, both sides executed
+node examples/contrast.mjs --offline  # skip the seven that call the live API
 ```
 
-Five failures, each executed on both sides — the numbers below are what the queries actually returned, not a description of what would happen.
+Every row below was executed on both sides. The failing values are what the queries actually returned.
+
+**Queries that run clean and return the wrong answer**
 
 | | Ordinary tooling | JevSQL |
 |---|---|---|
-| Revenue joined to line items | runs clean, returns **3750** (real revenue: 1250) | refuses to compile: the join can multiply aggregate rows |
-| `WITH gone AS (DELETE FROM orders …) SELECT …` | leading-keyword guard says **read-only, allowed** — 3 orders and 9 line items gone | classified `delete`, destructive, no WHERE clause |
-| Tenant id interpolated from the request | returns **1250** for `tenant-a' OR '1'='1'` | returns **350**; the tenant comes from the authenticated actor |
-| `up` then `down`, both exit 0 | **"rolled back successfully"** — 3 rows → 0 | rejected: schema restored, rows **not** restored |
-| Finding billing complaints in support tickets | keyword search: 3/5 found, 3 false positives | `jev_bool(...)`: 5/5, 0 false positives, one request, $0.000046 |
+| Revenue joined to line items | returns **3750** (real revenue: 1250) | refuses to compile: the join can multiply rows |
+| `UNIQUE` column joined under a different collation | foreign key exists, so **20** (the one order is 10) | refuses: uniqueness is `BINARY`, the join compares `NOCASE` |
+| `v <> 'a'` rewritten as `v IS NOT 'a'` | review says "same predicate, negated" | differs on the **null values** fixture |
+| A view replaced and a trigger added | table diff says **no change** | `view_changed`, `trigger_added` |
 
-The last row calls the live API. The other four need no key and no network.
+**Statements that should never have run**
 
-Every wrong answer in that list ran cleanly and returned a number somebody would have believed. That is the failure mode this project exists for: not queries that crash, but queries that succeed and are wrong.
+| | Ordinary tooling | JevSQL |
+|---|---|---|
+| `WITH gone AS (DELETE …) SELECT …` | guard says **read-only, allowed** — 3 orders, 9 items gone | `delete`, destructive, no WHERE clause |
+| Tenant id interpolated from the request | **1250** for `tenant-a' OR '1'='1'` | **350**, tenant from the authenticated actor |
+| A tenant column called `account_id` | heuristic finds no `tenant_id`, returns **both tenants** | refuses to compile until it is classified |
+| `SELECT id` where `people.id` is denied | name blocklist sees no `salary`, **allows it** | resolves the rowid read, `column_not_allowed` |
+| A reviewed query replayed, or the actor swapped | signed token stays valid | permit is single-use and bound to actor, params, schema |
+
+**Migrations, operations, and meaning**
+
+| | Ordinary tooling | JevSQL |
+|---|---|---|
+| `up` then `down`, both exit 0 | **"rolled back successfully"**, 3 rows → 0 | rejected: schema restored, rows **not** |
+| Migration vs. the schema in the PR description | approved | rejected: declared `country`, DDL adds `region` |
+| TypeScript model vs. the live schema | `tsc` says **0 errors** | two block-level divergences that fail at runtime |
+| A 12-row `Seq Scan` | "seq scan, add an index" | 0 symptoms; the *index scan* off by 980,000× is the incident |
+| Three sessions waiting in a circle | kill the longest waiter (a victim) | `deadlock-cycle`, with the participants |
+| A backup that succeeded | green tick | `verified-but-never-restored`, 0 restore drills |
+| A replica reporting 0 ms lag | healthy | `telemetry-stale` — last value 15 minutes ago |
+| Billing complaints in support tickets | keywords: 3/5, 3 false positives | `jev_bool`: **5/5, 0 false positives** |
+| Routing tickets to a team | keyword rules: 5/10 | `jev_choice`: **9/10** |
+| Same company, different legal name | token similarity: 0/3 | `jev_match`: **3/3** |
+| Ten rows, one question | 10 requests, 3460 tokens, $0.000145 | **1 request, 1084 tokens, $0.000046** |
+| A gate that blocks every case | false allows 0, so **pass** | `review` — `false_block_rate`, `safe_allow_rate` |
+
+Every wrong answer in those tables ran cleanly and returned something somebody would have believed. That is the failure mode this project exists for: not queries that crash, but queries that succeed and are wrong.
+
+Two of the 31 are deliberately *not* wins. The secret scanner and the typed review each score 2/3 alone and 3/3 together — rules find the obvious tokens, the review reads the prose, and neither replaces the other. The last comparison reports that nothing here is ready to switch on.
 
 > The ticket sample is ten rows. It shows the shape of the difference, not a calibration result — see [what this project has not established](#what-this-project-has-not-established).
 

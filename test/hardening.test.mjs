@@ -18,6 +18,7 @@ import { inspectQuery, classifyStatement } from '../src/sql-inspector.mjs';
 import { relaxForCollect } from '../src/rewrite.mjs';
 import { validateAnswer } from '../src/validation.mjs';
 import { normalizeSchema, diffSchemas } from '../src/schema.mjs';
+import { redactState } from '../src/privacy.mjs';
 import { startMockServer } from './mock-server.mjs';
 
 /** Everything any question was asked about, across every outbound request. */
@@ -299,4 +300,19 @@ test('a governed read still reports the scope it actually enforced', async (t) =
   const { rows } = await gate.execute(prepared.permit, { actor, params: { id: 0 } });
   assert.deepEqual(rows.map((row) => row.body), ['first']);
   await service.close();
+});
+
+test('card numbers are redacted, and numbers that only look like cards are not', () => {
+  const { state, redactions } = redactState({
+    note: 'Card 4111 1111 1111 1111 declined', dashed: 'try 4111-1111-1111-1111',
+    amex: '378282246310005', order: 'Order number 1234567890123456 shipped',
+    invoice: 'invoice 2026001234567 is overdue',
+  });
+  assert.match(state.note, /Card \[card removed\] declined/);
+  assert.match(state.dashed, /\[card removed\]/);
+  assert.equal(state.amex, '[card removed]');
+  // A Luhn check keeps identifiers of the same length intact.
+  assert.equal(state.order, 'Order number 1234567890123456 shipped');
+  assert.equal(state.invoice, 'invoice 2026001234567 is overdue');
+  assert.equal(redactions, 3);
 });

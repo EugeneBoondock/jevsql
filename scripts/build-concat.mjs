@@ -7,11 +7,11 @@ const lines = raw.replace(/\r/g, '').split('\n');
 while (lines.length && !lines.at(-1).trim()) lines.pop();
 
 const pace = (line) => {
-  if (!line.trim()) return 0.16;
-  if (/^\s{2}\d+\./.test(line)) return 1.15;            // section heading
-  if (/^\s{2}JevSQL/.test(line)) return 1.4;            // title
-  if (/^\s{5}\S/.test(line) && !/\s{2,}/.test(line.trim())) return 0.62; // prose note
-  return 0.44;                                          // data row
+  if (!line.trim()) return 0.14;
+  if (/^\s{2}\d+\./.test(line)) return 0.95;                // section heading
+  if (/^\s{2}JevSQL/.test(line)) return 1.2;                 // title
+  if (/^\s{5}\S/.test(line) && !/\s{2,}/.test(line.trim())) return 0.50;
+  return 0.38;                                          // data row
 };
 
 const entries = [];
