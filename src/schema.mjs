@@ -178,6 +178,28 @@ function sortContracts(items, mode) {
  * PostgreSQL catalog names are case-sensitive, including quoted identifiers.
  * MySQL and unknown dialects default to sensitive; identifierCase can override it.
  */
+function normalizeView(view, mode) {
+  name(view?.name);
+  const columns = list(view.columns ?? [], 'View columns').map((column) => {
+    name(column?.name);
+    return { name: column.name, type: sql(column.type ?? ''), nullable: column.nullable !== false,
+      ...(column.position === undefined ? {} : { position: column.position }) };
+  });
+  uniqueNames(columns, mode, 'view column');
+  return { name: view.name, kind: 'view', columns: uniqueNames(columns, mode, 'view column'),
+    definition: view.definition == null ? null : sql(view.definition) };
+}
+
+function normalizeTrigger(trigger, mode) {
+  name(trigger?.name);
+  return { name: trigger.name, table: trigger.table == null ? null : name(trigger.table),
+    timing: trigger.timing == null ? null : upper(trigger.timing), event: trigger.event == null ? null : upper(trigger.event),
+    definition: trigger.definition == null ? null : sql(trigger.definition) };
+}
+
+/** Return a fresh canonical snapshot. Views and triggers are part of the
+ * contract a consumer depends on, so they participate in the hash and the diff.
+ */
 export function normalizeSchema(snapshot) {
   if (!snapshot || typeof snapshot !== 'object') throw new TypeError('A schema snapshot is required.');
   let dialect = lower(name(snapshot.dialect ?? 'sqlite'));
@@ -187,7 +209,11 @@ export function normalizeSchema(snapshot) {
   if (!['sensitive', 'insensitive'].includes(identifierCase)) throw new TypeError('Invalid identifierCase.');
   const tables = uniqueNames(list(snapshot.tables, 'Schema tables').map((table) => normalizeTable(table, identifierCase)),
     identifierCase, 'table');
-  const payload = { version: VERSION, dialect, identifierCase, tables };
+  const views = uniqueNames(list(snapshot.views ?? [], 'Schema views').map((view) => normalizeView(view, identifierCase)),
+    identifierCase, 'view');
+  const triggers = uniqueNames(list(snapshot.triggers ?? [], 'Schema triggers').map((trigger) => normalizeTrigger(trigger, identifierCase)),
+    identifierCase, 'trigger');
+  const payload = { version: VERSION, dialect, identifierCase, tables, views, triggers };
   return { ...payload, hash: digest(comparable(payload, identifierCase)) };
 }
 
@@ -265,7 +291,7 @@ export function inspectSchema(db, { includeSystem = false } = {}) {
   const read = (text, ...args) => db.prepare(text).all(...args);
   const schemaVersion = () => read('PRAGMA main.schema_version')[0].schema_version;
   const start = schemaVersion();
-  const catalog = read("SELECT name, type, tbl_name, sql FROM main.sqlite_schema WHERE type IN ('table', 'index')");
+  const catalog = read("SELECT name, type, tbl_name, sql FROM main.sqlite_schema WHERE type IN ('table', 'index', 'view', 'trigger')");
   const properties = new Map(read('PRAGMA main.table_list').filter((row) => row.schema === 'main').map((row) => [row.name, row]));
   const columnCache = new Map();
   const columnsFor = (table) => {
@@ -320,12 +346,30 @@ export function inspectSchema(db, { includeSystem = false } = {}) {
     readTableClauses(table, row.sql ?? '');
     return table;
   });
+  // A replaced view or a new insert-blocking trigger changes what consumers see
+  // without changing any table, so both are collected as part of the contract.
+  const views = catalog.filter((row) => row.type === 'view'
+    && (includeSystem || !lower(row.name).startsWith('_jevsql_'))).map((row) => ({
+    name: row.name,
+    columns: columnsFor(row.name).map((column) => ({ name: column.name, type: column.type,
+      nullable: !column.notnull, position: column.cid })),
+    definition: row.sql ?? null,
+  }));
+  const triggers = catalog.filter((row) => row.type === 'trigger'
+    && (includeSystem || !lower(row.tbl_name ?? '').startsWith('_jevsql_'))).map((row) => {
+    const parts = tokens(row.sql ?? '');
+    const at = parts.findIndex((part) => ['BEFORE', 'AFTER', 'INSTEAD'].includes(upper(part)));
+    const event = parts.slice(at + 1).find((part) => ['INSERT', 'UPDATE', 'DELETE'].includes(upper(part)));
+    return { name: row.name, table: row.tbl_name ?? null,
+      timing: at < 0 ? null : upper(parts[at] === 'INSTEAD' ? 'INSTEAD OF' : parts[at]),
+      event: event ? upper(event) : null, definition: row.sql ?? null };
+  });
   if (start !== schemaVersion()) {
     const error = new Error('Schema changed during inspection. Inspect it again.');
     error.code = 'SCHEMA_CHANGED_DURING_INSPECTION';
     throw error;
   }
-  return normalizeSchema({ dialect: 'sqlite', tables });
+  return normalizeSchema({ dialect: 'sqlite', tables, views, triggers });
 }
 
 function defaultKind(value) {
@@ -483,6 +527,34 @@ export function diffSchemas(before, after) {
         null, item, { columns: constraintScope(item) });
     }
   }
+  // Views and triggers are contracts too: replacing a view silently changes what
+  // a report reads, and a new trigger can reject writes that used to succeed.
+  for (const [field, prefix, severityFor] of [
+    ['views', 'view', () => 'review'],
+    ['triggers', 'trigger', (before, after) => (!after && before?.event ? 'review' : 'review')],
+  ]) {
+    const oldItems = new Map(oldSchema[field].map((item) => [key(item.name), item]));
+    const newItems = new Map(newSchema[field].map((item) => [key(item.name), item]));
+    for (const [id, item] of oldItems) {
+      if (!newItems.has(id)) {
+        add(`${prefix}_removed`, item.table ?? item.name, field === 'views' ? 'block' : 'review',
+          field === 'views' ? 'A view its consumers read was removed.' : 'A trigger that enforced behaviour was removed.',
+          item, null, { [prefix]: item.name });
+      }
+    }
+    for (const [id, item] of newItems) {
+      const old = oldItems.get(id);
+      if (!old) {
+        add(`${prefix}_added`, item.table ?? item.name, field === 'views' ? 'safe' : 'review',
+          field === 'views' ? 'A new view was added.' : 'A new trigger can reject or rewrite writes that previously succeeded.',
+          null, item, { [prefix]: item.name });
+      } else if (!equal(old, item)) {
+        add(`${prefix}_changed`, item.table ?? item.name, severityFor(old, item),
+          field === 'views' ? 'The view definition or its output columns changed.' : 'The trigger definition changed.',
+          old, item, { [prefix]: item.name });
+      }
+    }
+  }
   return changes.sort((a, b) => compare(stable([a.table, a.column ?? '', a.kind, a.id]), stable([b.table, b.column ?? '', b.kind, b.id])));
 }
 
@@ -587,5 +659,10 @@ export function pruneSchema(snapshot, selectedTables, { maxTables = 50 } = {}) {
     for (const id of tables.keys()) if (paths[i].get(id) + paths[j].get(id) === length) required.add(id);
   }
   if (required.size > maxTables) failBudget([...required]);
-  return normalizeSchema({ ...schema, tables: schema.tables.filter((table) => required.has(key(table.name))) });
+  // Triggers follow their table. A view body is not parsed, so a view is kept
+  // only when it was selected by name; pruning never invents a dependency.
+  return normalizeSchema({ ...schema,
+    tables: schema.tables.filter((table) => required.has(key(table.name))),
+    views: schema.views.filter((view) => selected.includes(key(view.name))),
+    triggers: schema.triggers.filter((trigger) => trigger.table != null && required.has(key(trigger.table))) });
 }

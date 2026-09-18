@@ -142,6 +142,61 @@ const DEFINITIONS = {
     }),
     placeholder: noul('Is the supplied value clearly a placeholder, redaction marker, test fixture or documentation example?'),
   } },
+  // Wait graphs and cycles are computed upstream; the family is the judgement.
+  locks: { questions: {
+    family: choice('Which contention family best explains the computed wait evidence?', {
+      transaction_scope: 'A transaction holds locks longer than its work requires',
+      access_order: 'Competing transactions take the same locks in different orders',
+      ddl_contention: 'A schema change is blocking ordinary traffic',
+      queue_contention: 'Workers compete for the same small set of rows',
+      long_running_read: 'A long read is holding a snapshot others wait behind',
+      unknown: 'Insufficient or conflicting evidence',
+    }),
+    application_fault: noul('Do the supplied statements suggest an application defect rather than ordinary load?'),
+    impact: severity,
+  } },
+  backup: { questions: {
+    recovery_credible: noul('Does the supplied evidence show a restore that was actually performed and verified, rather than a backup that merely completed?'),
+    weakness: choice('Which recovery weakness does the supplied evidence most support?', {
+      never_restored: 'Backups exist but no restore has been demonstrated',
+      stale: 'The newest usable backup is older than the stated objective',
+      failing: 'Recent backup jobs are failing',
+      unverified: 'Backups complete without verification',
+      coverage_gap: 'Some described data is not covered by any job',
+      none: 'The supplied evidence shows no weakness',
+      unknown: 'Insufficient evidence',
+    }),
+    impact: severity,
+  } },
+  replication: { questions: {
+    family: choice('Which replication incident family fits the computed evidence?', {
+      lag: 'A replica is behind beyond the stated threshold', conflict: 'Apply conflicts are blocking progress',
+      broken_slot: 'A slot or channel has stopped advancing', schema_incompatibility: 'A schema change is incompatible with a subscriber',
+      network: 'Transport or connectivity evidence dominates', none: 'The evidence shows no incident',
+      unknown: 'Insufficient evidence',
+    }),
+    read_unsafe: noul('Would serving reads from the supplied replica risk returning data the user has already changed?'),
+    impact: severity,
+  } },
+  // The comparison is deterministic; only the meaning of a difference is not.
+  types: { questions: {
+    same_concept: noul('Do the application field and the database column represent the same business concept, not merely a compatible storage type?'),
+    breaks_at_runtime: noul('Would the supplied divergence produce an error or a wrong value during ordinary use, rather than only in an unusual case?'),
+    class: choice('How should this divergence be resolved?', {
+      fix_application: 'The declared application type is wrong', fix_schema: 'The column is wrong',
+      intentional: 'The difference is deliberate and documented', needs_migration: 'Resolving it requires a data change',
+      unknown: 'Insufficient evidence',
+    }),
+  } },
+  dialect: { questions: {
+    equivalent: noul('Do the two statements express the same intent on their respective engines, including null handling, ordering, row multiplicity and type coercion?'),
+    class: choice('Which portability class describes the difference?', {
+      syntax_only: 'Only spelling differs', behavioural: 'Results can differ for some inputs',
+      transactional: 'Transaction or locking semantics differ', operational: 'Deployment or maintenance behaviour differs',
+      unsupported: 'The target engine has no equivalent', unknown: 'Insufficient evidence',
+    }),
+    needs_property_test: noul('Does the difference require executing both statements on shared fixtures before it can be accepted?'),
+  } },
   realism: { questions: {
     plausible: noul('Do the synthetic records describe a plausible business scenario given their already-verified constraints and date relationships?'),
     contradictory: noul('Do their descriptions or categories contradict the stated business rules?'),

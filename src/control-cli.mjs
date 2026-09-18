@@ -6,6 +6,12 @@ import { DatabaseControl, DecisionService, ReceiptStore, GovernedQueries, SQLite
 import { diffSchemas, affectedAssets } from './schema.mjs';
 import { analyzePlan, summarizeWorkload, routeReplica } from './telemetry.mjs';
 import { evaluateBinary, evaluateMulticlass, compareEvaluations, qualifyRelease } from './metrics.mjs';
+import { verifyMigration } from './migration-runner.mjs';
+import { generateSeedData } from './seed.mjs';
+import { proposeIndexes, measureIndexCandidate } from './candidates.mjs';
+import { runAdversarialSuite, scanState } from './injection.mjs';
+import { EvaluationCorpus } from './corpus.mjs';
+import { assessWorkflow } from './shadow.mjs';
 import { integer, nonNegative } from './validation.mjs';
 
 const HELP = `jevsql control: governed reads, database reviews and measured release checks
@@ -23,6 +29,22 @@ USAGE
   jevsql control triage incident.json         review plan symptoms or approved runbooks
   jevsql control workload events.json         deterministic query and N+1 measurements
   jevsql control replica cluster.json         choose a node from fresh health and lag evidence
+  jevsql control locks waits.json             build a wait-for graph and triage contention
+  jevsql control backups jobs.json            recovery posture against stated RPO/RTO
+  jevsql control replication nodes.json       replication posture and incident family
+  jevsql control types model.json             application types against the live schema
+  jevsql control orm traces.json              repeated-query evidence and ORM fault class
+  jevsql control lineage jobs.json            lineage graph, inherited sensitivity, odd edges
+  jevsql control candidate candidate.json     review a rewrite with its measured evidence
+  jevsql control dialect pair.json            cross-engine equivalence review
+  jevsql control secrets fragments.json       judge ambiguous credential-like values
+  jevsql control cost workloads.json          group measured spend by business purpose
+  jevsql control replay migration.json        replay a migration, run packs, check rollback
+  jevsql control seed schema.json             generate deterministic FK-aware fixtures
+  jevsql control indexes workload.json --db db  propose and measure index candidates
+  jevsql control adversarial                  run the built-in injection suite
+  jevsql control corpus --store corpus.db     evaluation corpus coverage
+  jevsql control promote workflow.json --store corpus.db  promotion-ladder status
   jevsql control route request.json --db db    preview a registered typed query
   jevsql control run request.json --db db      review and execute an eligible registered read
   jevsql control compare queries.json --db db compare bounded results in one read snapshot
@@ -112,9 +134,39 @@ export async function controlMain(argv) {
     } finally { store.close(); }
     return;
   }
-  const standalone = ['drift', 'plan', 'workload', 'replica', 'metrics', 'qualify', 'compare-metrics'];
+  // Deterministic commands: no model, no key, no network.
+  const standalone = ['drift', 'plan', 'workload', 'replica', 'metrics', 'qualify', 'compare-metrics',
+    'replay', 'seed', 'adversarial', 'corpus', 'promote'];
   if (standalone.includes(command)) {
+    if (command === 'adversarial') {
+      const suite = await runAdversarialSuite(async (text) => (scanState({ evidence: text }).highConfidence ? 'review' : 'allow'));
+      output({ ...suite, status: suite.allowed === 0 ? 'pass' : 'blocked',
+        note: 'Detector-only run. In a review the same findings remove eligibility.' });
+      return;
+    }
+    if (['corpus', 'promote'].includes(command)) {
+      if (!opts.store) throw new Error('This command needs --store <corpus file>.');
+      const corpus = new EvaluationCorpus(opts.store);
+      try {
+        if (command === 'corpus') output({ ...corpus.coverage(), status: corpus.coverage().ready ? 'pass' : 'review' });
+        else {
+          const input = jsonFile(file);
+          const assessment = assessWorkflow(corpus, input);
+          output({ ...assessment.promotion, status: assessment.promotion.stage ? 'pass' : 'review' });
+        }
+      } finally { corpus.close(); }
+      return;
+    }
     const input = jsonFile(file);
+    if (command === 'replay') {
+      const report = verifyMigration(input);
+      output({ ...report, status: report.ok ? 'pass' : 'blocked' });
+      return;
+    }
+    if (command === 'seed') {
+      output(generateSeedData(input.schema ?? input, input.options ?? {}));
+      return;
+    }
     if (command === 'drift') {
       const changes = diffSchemas(input.before, input.after);
       output({ decision: changes.some((change) => change.severity === 'block') ? 'block' : changes.some((change) => change.severity === 'review') ? 'review' : 'eligible',
@@ -130,9 +182,10 @@ export async function controlMain(argv) {
     else output(compareEvaluations(input.baseline, input.candidate));
     return;
   }
-  const supported = ['schema', 'migration', 'statement', 'query-review', 'review', 'select-schema', 'triage', 'route', 'run', 'compare'];
+  const supported = ['schema', 'migration', 'statement', 'query-review', 'review', 'select-schema', 'triage', 'route', 'run', 'compare',
+    'locks', 'backups', 'replication', 'types', 'orm', 'lineage', 'candidate', 'dialect', 'secrets', 'cost', 'indexes'];
   if (!supported.includes(command)) throw new Error(`Unknown control command ${command}. Use --help.`);
-  if (['schema', 'route', 'run', 'compare'].includes(command) && !opts.db) throw new Error('This command needs --db <existing file>.');
+  if (['schema', 'route', 'run', 'compare', 'indexes'].includes(command) && !opts.db) throw new Error('This command needs --db <existing file>.');
   if (opts.db && !existsSync(opts.db)) throw new Error('The database file does not exist.');
   const engine = opts.db ? new JevSQL({ db: opts.db }) : null;
   let store, service;
@@ -140,6 +193,19 @@ export async function controlMain(argv) {
     if (command === 'schema') { output(new DatabaseControl({ engine }).schema()); return; }
     const input = jsonFile(file);
     if (command === 'compare') { output(await compareReads(engine, input)); return; }
+    if (command === 'indexes') {
+      // Deterministic end to end: propose from the workload, then measure each
+      // candidate against the real data in this database.
+      const schema = new DatabaseControl({ engine }).schema();
+      const candidates = proposeIndexes(schema, input.workload ?? input.statements ?? []);
+      const measured = candidates.map((candidate) => {
+        const probe = (input.measure ?? []).find((entry) => !entry.candidate || entry.candidate === candidate.name)
+          ?? { sql: (input.workload ?? [])[0]?.sql ?? (input.workload ?? [])[0], params: [] };
+        return probe?.sql ? measureIndexCandidate(engine.db, candidate, probe) : { candidate: candidate.name, applied: false, error: 'no probe supplied' };
+      });
+      output({ candidates, measured, decision: measured.some((item) => item.verdict === 'faster') ? 'review' : 'eligible' });
+      return;
+    }
     store = opts.store && !opts.dryRun ? new ReceiptStore(opts.store) : null;
     service = new DecisionService({ ...(opts.model ? { model: opts.model } : {}),
       ...(opts.maxJudgments !== undefined ? { maxJudgments: opts.maxJudgments } : {}),
@@ -152,6 +218,16 @@ export async function controlMain(argv) {
     else if (command === 'select-schema') output(await control.selectSchema(input, options));
     else if (command === 'triage') output(input.runbooks ? await control.triageIncident(input, options) : await control.triagePlan(input, options));
     else if (command === 'review') output(input.policy ? await control.custom(input.policy, input.state, options) : await control.review(input.kind, input.state, options));
+    else if (command === 'locks') output(await control.triageLocks(input, options));
+    else if (command === 'backups') output(await control.reviewBackups(input, options));
+    else if (command === 'replication') output(await control.reviewReplication(input, options));
+    else if (command === 'types') output(await control.reviewTypes(input, options));
+    else if (command === 'orm') output(await control.reviewOrm(input, options));
+    else if (command === 'lineage') output(await control.reviewLineage(input, options));
+    else if (command === 'candidate') output(await control.reviewCandidate(input, options));
+    else if (command === 'dialect') output(await control.reviewDialect(input, options));
+    else if (command === 'secrets') output(await control.reviewSecrets(input, options));
+    else if (command === 'cost') output(await control.reviewCost(input, options));
     else {
       const gate = new GovernedQueries({ service, adapter: new SQLiteAdapter(engine), templates: input.templates,
         tenantColumns: input.tenantColumns ?? {}, allowExecution: command === 'run' && !opts.dryRun });

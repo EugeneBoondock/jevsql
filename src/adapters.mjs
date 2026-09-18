@@ -41,11 +41,39 @@ export class SQLiteAdapter {
 }
 
 const COLUMNS = `SELECT c.table_schema,c.table_name,c.column_name,c.data_type,c.character_maximum_length,
-  c.numeric_precision,c.numeric_scale,c.is_nullable,c.column_default,c.ordinal_position
+  c.numeric_precision,c.numeric_scale,c.is_nullable,c.column_default,c.ordinal_position,
+  c.collation_name,c.is_generated,c.generation_expression,t.table_type
   FROM information_schema.columns c JOIN information_schema.tables t
   ON t.table_schema=c.table_schema AND t.table_name=c.table_name
-  WHERE c.table_schema=PLACEHOLDER AND t.table_type='BASE TABLE'
+  WHERE c.table_schema=PLACEHOLDER AND t.table_type IN ('BASE TABLE','VIEW')
   ORDER BY c.table_name,c.ordinal_position`;
+const CHECKS = `SELECT t.table_schema,t.table_name,t.constraint_name,c.check_clause
+  FROM information_schema.table_constraints t JOIN information_schema.check_constraints c
+  ON c.constraint_schema=t.constraint_schema AND c.constraint_name=t.constraint_name
+  WHERE t.table_schema=PLACEHOLDER AND t.constraint_type='CHECK'
+  ORDER BY t.table_name,t.constraint_name`;
+const VIEWS = `SELECT table_schema,table_name,view_definition FROM information_schema.views
+  WHERE table_schema=PLACEHOLDER ORDER BY table_name`;
+const PG_INDEXES = `SELECT ns.nspname AS table_schema,c.relname AS table_name,i.relname AS index_name,
+  idx.indisunique AS is_unique,(idx.indpred IS NOT NULL) AS is_partial,keys.position AS ordinal_position,
+  a.attname AS column_name,pg_catalog.pg_get_indexdef(idx.indexrelid,keys.position::int,true) AS term_definition
+  FROM pg_catalog.pg_index idx JOIN pg_catalog.pg_class c ON c.oid=idx.indrelid
+  JOIN pg_catalog.pg_class i ON i.oid=idx.indexrelid
+  JOIN pg_catalog.pg_namespace ns ON ns.oid=c.relnamespace
+  CROSS JOIN LATERAL unnest(idx.indkey) WITH ORDINALITY AS keys(attnum,position)
+  LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid AND a.attnum=keys.attnum
+  WHERE ns.nspname=$1 AND NOT idx.indisprimary ORDER BY c.relname,i.relname,keys.position`;
+const MYSQL_INDEXES = `SELECT table_schema,table_name,index_name,(non_unique=0) AS is_unique,
+  seq_in_index AS ordinal_position,column_name,expression AS term_definition,collation
+  FROM information_schema.statistics WHERE table_schema=? AND index_name<>'PRIMARY'
+  ORDER BY table_name,index_name,seq_in_index`;
+const MYSQL_TRIGGERS = `SELECT trigger_schema,trigger_name,event_object_table,action_timing,event_manipulation,action_statement
+  FROM information_schema.triggers WHERE trigger_schema=? ORDER BY trigger_name`;
+const PG_TRIGGERS = `SELECT ns.nspname AS trigger_schema,t.tgname AS trigger_name,c.relname AS event_object_table,
+  pg_catalog.pg_get_triggerdef(t.oid) AS action_statement
+  FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid=t.tgrelid
+  JOIN pg_catalog.pg_namespace ns ON ns.oid=c.relnamespace
+  WHERE ns.nspname=$1 AND NOT t.tgisinternal ORDER BY t.tgname`;
 const CONSTRAINTS = `SELECT t.table_schema,t.table_name,t.constraint_name,t.constraint_type,k.column_name,k.ordinal_position
   FROM information_schema.table_constraints t JOIN information_schema.key_column_usage k
   ON t.constraint_schema=k.constraint_schema AND t.constraint_name=k.constraint_name AND t.table_name=k.table_name
@@ -71,31 +99,76 @@ const MYSQL_FK = `SELECT k.table_schema,k.table_name,k.constraint_name,k.column_
 const ruleName = (value) => ({ a: 'NO ACTION', r: 'RESTRICT', c: 'CASCADE', n: 'SET NULL', d: 'SET DEFAULT' })[value] ?? value;
 const lowerKeys = (row) => Object.fromEntries(Object.entries(row).map(([key, value]) => [key.toLowerCase(), value]));
 
+/** A remote snapshot only describes what its server would answer. Optional
+ * catalogs — check constraints before MySQL 8.0.16, expression index columns —
+ * are collected when available and recorded as missing when they are not, so a
+ * narrower snapshot is visible rather than silently equal to a complete one.
+ */
 async function remoteSnapshot(run, dialect, schemaName) {
   const marker = dialect === 'postgresql' ? '$1' : '?';
+  const missing = [];
+  const optional = async (label, sql, params) => {
+    try { return (await run(sql, params)).map(lowerKeys); }
+    catch { missing.push(label); return []; }
+  };
   const columns = (await run(COLUMNS.replace('PLACEHOLDER', marker), [schemaName])).map(lowerKeys);
   const constraints = (await run(CONSTRAINTS.replace('PLACEHOLDER', marker), [schemaName])).map(lowerKeys);
   const foreign = (await run(dialect === 'postgresql' ? PG_FK : MYSQL_FK, [schemaName])).map(lowerKeys);
-  const tables = new Map();
+  const indexes = await optional('indexes', dialect === 'postgresql' ? PG_INDEXES : MYSQL_INDEXES, [schemaName]);
+  const checks = await optional('checks', CHECKS.replace('PLACEHOLDER', marker), [schemaName]);
+  const viewRows = await optional('views', VIEWS.replace('PLACEHOLDER', marker), [schemaName]);
+  const triggerRows = await optional('triggers', dialect === 'postgresql' ? PG_TRIGGERS : MYSQL_TRIGGERS, [schemaName]);
+
+  const tables = new Map(), views = new Map();
   for (const row of columns) {
     const name = `${row.table_schema}.${row.table_name}`;
-    if (!tables.has(name)) tables.set(name, { name, columns: [], indexes: [], foreignKeys: [] });
+    const isView = String(row.table_type).toUpperCase() === 'VIEW';
     let type = row.data_type;
     if (row.character_maximum_length != null) type += `(${row.character_maximum_length})`;
     else if (['numeric', 'decimal'].includes(type) && row.numeric_precision != null) type += `(${row.numeric_precision},${row.numeric_scale ?? 0})`;
-    const pk = constraints.find((c) => c.table_name === row.table_name && c.column_name === row.column_name && c.constraint_type === 'PRIMARY KEY');
     // ordinal_position is 1-based in information_schema; snapshots are 0-based.
     // Without it, a reordered catalog would hash identically to the original.
     const position = Number(row.ordinal_position);
     if (!Number.isSafeInteger(position) || position < 1) throw new TypeError('Catalog returned an invalid ordinal_position.');
+    if (isView) {
+      if (!views.has(name)) views.set(name, { name, columns: [], definition: null });
+      views.get(name).columns.push({ name: row.column_name, type, nullable: row.is_nullable === 'YES', position: position - 1 });
+      continue;
+    }
+    if (!tables.has(name)) tables.set(name, { name, columns: [], indexes: [], foreignKeys: [], constraints: [] });
+    const pk = constraints.find((c) => c.table_name === row.table_name && c.column_name === row.column_name && c.constraint_type === 'PRIMARY KEY');
+    const generated = row.generation_expression ? { expression: String(row.generation_expression),
+      storage: String(row.is_generated ?? '').toUpperCase().includes('STORED') ? 'stored' : 'virtual' } : null;
     tables.get(name).columns.push({ name: row.column_name, type, nullable: row.is_nullable === 'YES',
-      defaultValue: row.column_default ?? null, primaryKey: pk ? Number(pk.ordinal_position) : 0, position: position - 1 });
+      defaultValue: row.column_default ?? null, primaryKey: pk ? Number(pk.ordinal_position) : 0, position: position - 1,
+      collation: row.collation_name ?? null, generated });
   }
   for (const row of constraints) {
     const table = tables.get(`${row.table_schema}.${row.table_name}`); if (!table) continue;
     let index = table.indexes.find((item) => item.name === row.constraint_name);
-    if (!index) { index = { name: row.constraint_name, columns: [], unique: true }; table.indexes.push(index); }
+    if (!index) { index = { name: row.constraint_name, columns: [], unique: true, terms: [] }; table.indexes.push(index); }
     index.columns.push(row.column_name);
+    index.terms.push({ column: row.column_name });
+  }
+  for (const row of indexes) {
+    const table = tables.get(`${row.table_schema}.${row.table_name}`); if (!table) continue;
+    if (table.indexes.some((item) => item.name === row.index_name && !item.terms.length)) continue;
+    let index = table.indexes.find((item) => item.name === row.index_name);
+    if (!index) {
+      index = { name: row.index_name, columns: [], unique: Boolean(Number(row.is_unique)),
+        partial: Boolean(Number(row.is_partial ?? 0)), terms: [] };
+      table.indexes.push(index);
+    }
+    // An expression term has no column name in either catalog; keep it as an
+    // expression so the diff can still see it change.
+    const column = row.column_name ?? null;
+    index.columns.push(column);
+    index.terms.push({ column, descending: String(row.collation ?? '').toUpperCase() === 'D',
+      ...(column === null && row.term_definition ? { expression: String(row.term_definition) } : {}) });
+  }
+  for (const row of checks) {
+    const table = tables.get(`${row.table_schema}.${row.table_name}`); if (!table) continue;
+    table.constraints.push({ kind: 'check', name: row.constraint_name, columns: [], expression: String(row.check_clause) });
   }
   for (const row of foreign) {
     const table = tables.get(`${row.table_schema}.${row.table_name}`); if (!table) continue;
@@ -107,7 +180,17 @@ async function remoteSnapshot(run, dialect, schemaName) {
     }
     fk.columns.push(row.column_name); fk.referenceColumns.push(row.referenced_column_name);
   }
-  return normalizeSchema({ dialect, tables: [...tables.values()] });
+  for (const row of viewRows) {
+    const name = `${row.table_schema}.${row.table_name}`;
+    if (!views.has(name)) views.set(name, { name, columns: [], definition: null });
+    views.get(name).definition = row.view_definition ?? null;
+  }
+  const triggers = triggerRows.map((row) => ({
+    name: row.trigger_name, table: row.event_object_table == null ? null : `${schemaName}.${row.event_object_table}`,
+    timing: row.action_timing ?? null, event: row.event_manipulation ?? null, definition: row.action_statement ?? null,
+  }));
+  const snapshot = normalizeSchema({ dialect, tables: [...tables.values()], views: [...views.values()], triggers });
+  return missing.length ? { ...snapshot, unavailableCatalogs: missing } : snapshot;
 }
 
 /** A driver lease must be exclusive and idle. Use a database account restricted

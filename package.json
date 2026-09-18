@@ -14,7 +14,18 @@
     "./metrics": "./src/metrics.mjs",
     "./adapters": "./src/adapters.mjs",
     "./queries": "./src/query-compiler.mjs",
-    "./evaluation": "./src/evaluation.mjs"
+    "./evaluation": "./src/evaluation.mjs",
+    "./app-types": "./src/app-types.mjs",
+    "./candidates": "./src/candidates.mjs",
+    "./corpus": "./src/corpus.mjs",
+    "./escalation": "./src/escalation.mjs",
+    "./injection": "./src/injection.mjs",
+    "./lineage": "./src/lineage.mjs",
+    "./migrations": "./src/migration-runner.mjs",
+    "./operations": "./src/operations.mjs",
+    "./seed": "./src/seed.mjs",
+    "./semantic-layer": "./src/semantic-layer.mjs",
+    "./shadow": "./src/shadow.mjs"
   },
   "bin": { "jevsql": "bin/jevsql.mjs" },
   "files": ["src", "bin", "examples", "docs", "README.md", "LICENSE"],
@@ -23,7 +34,8 @@
     "test": "node --test \"test/**/*.test.mjs\"",
     "demo": "node examples/demo.mjs",
     "control": "node examples/control-plane.mjs",
-    "workflows": "node examples/workflows.mjs"
+    "workflows": "node examples/workflows.mjs",
+    "showcase": "node examples/showcase.mjs"
   },
   "keywords": ["typesafe", "jev", "system-one", "sql", "sqlite", "llm", "classification", "semantic-sql", "ai-database"],
   "license": "MIT",

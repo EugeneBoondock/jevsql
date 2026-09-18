@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="jevsql.png" alt="JevSQL — SQL with natural-language predicates, powered by TypeSafe's Jev" width="100%">
+</p>
+
 # JevSQL
 
 **Turn database rows into decisions you can query, inspect, refresh, and test.**
@@ -225,12 +229,70 @@ node bin/jevsql.mjs control --help
 |---|---|---|
 | `reviewStatement` | Classifies an agent-issued statement deterministically, then adds typed judgement on intent match, blast radius and shared-data reach | Execute anything. A read that matches its intent is `eligible`; every write needs approval, and a destructive or unbounded statement needs an out-of-band human |
 | `reviewQuery` | Reviews proposed SQL for intent, grain, scope, tenant and field-use risk, with SQLite compilation when a local database is supplied | Grant execution. External-dialect SQL is advisory only |
-| `reviewMigration` | Diffs two schema snapshots, resolves affected consumers, and returns required test packs as review evidence | Apply, test, or roll back a migration |
-| `triagePlan` / `triageIncident` | Measures an EXPLAIN plan in code, then classifies the cause or selects an approved runbook | Run a remediation |
+| `reviewMigration` | Diffs two schema snapshots, resolves affected consumers, and returns required test packs as review evidence | Apply, test, or roll back a migration — `verifyMigration` does that separately |
+| `reviewTypes` | Compares declared application types against the live schema and only asks about what the comparison could not settle | Read your source code. The model is supplied, not parsed |
+| `triagePlan` / `triageIncident` / `triageLocks` | Measures a plan, a workload or a wait-for graph in code, then classifies the cause or selects an approved runbook | Run a remediation, or compute a deadlock graph by inference |
+| `reviewBackups` / `reviewReplication` | Compares recovery objectives and replication lag in code, then judges the weakness or incident family | Restore, promote or fail over |
+| `reviewLineage` | Builds the lineage graph, propagates sensitivity downstream, flags edges that contradict declared ownership | Discover lineage you never recorded — `discoverLineage` proposes, it does not confirm |
+| `reviewCandidate` / `reviewDialect` | Judges whether a rewrite, index or translation preserves meaning, with measured and property-test evidence attached | Decide that something is faster. `measureIndexCandidate` measures |
+| `reviewOrm` / `reviewCost` / `reviewSecrets` | Classifies repeated-query faults, groups measured spend by purpose, judges ambiguous credential-like values | Count queries, do cost arithmetic, or rotate a secret |
 | `selectSchema` | Prunes a schema to the tables a request needs, keeping foreign-key bridges | Guarantee the pruned schema is sufficient |
-| `GovernedQueries` | Routes a request to a registered template, compiles bound SQL, and issues a single-use execution permit | Accept SQL fragments, model-supplied values, or a changed actor, template or schema after review |
+| `GovernedQueries` / `SemanticLayer` | Routes a request to a registered template or approved metric, compiles bound SQL, issues a single-use execution permit | Accept SQL fragments, model-supplied values, or a changed actor, template or schema after review |
 
 Arithmetic, dates, permissions and execution stay in code throughout. A typed answer decides *eligibility*; it never decides *authorization*.
+
+### Everything deterministic stays deterministic
+
+These need no API key, no network and no model. They are the half of each workflow that must keep working even if every model answer is wrong.
+
+```bash
+node bin/jevsql.mjs control replay migration.json    # apply, run packs, roll back, compare
+node bin/jevsql.mjs control seed schema.json         # FK-aware fixtures from a seed
+node bin/jevsql.mjs control indexes workload.json --db app.db
+node bin/jevsql.mjs control adversarial              # the built-in injection suite
+```
+
+- **`verifyMigration`** replays a migration on a scratch database: it proves the DDL produces the schema the review was written against, runs the named test packs, and checks that the rollback restores both the shape *and* the rows. A `down` that recreates the table and loses the data is reported as a failed rollback, not a successful one.
+- **`generateSeedData`** walks the foreign-key graph in topological order with a seeded generator, so the same seed always produces the same fixture and the database itself accepts the rows. Cycles are reported rather than silently reordered.
+- **`proposeIndexes`** / **`measureIndexCandidate`** propose composite indexes from a workload's access pattern, then build each one, time the statement, compare the plan and drop it again. The improvement is measured, never inferred.
+- **`propertyCompare`** runs two statements against deliberately awkward fixtures — nulls, duplicates, empty sets, mixed case. It catches the classic rewrites that stop being equivalent exactly where NULLs appear.
+- **`buildLockGraph`**, **`summarizeBackups`**, **`summarizeReplication`** turn raw operational telemetry into named buckets. A replica whose telemetry stopped reports as `telemetry-stale`, not as healthy; a backup nobody restored reports as `verified-but-never-restored`.
+
+### Untrusted content
+
+Row values, SQL comments, incident logs and operator notes are data that can be written by whoever is being reviewed. Two independent mechanisms, because a detector alone is not a boundary:
+
+```js
+import { fence, scanState } from 'jevsql/injection';
+const { state } = fence({ request, row }, { fields: ['row.body'] });
+```
+
+`fence()` wraps untrusted values in a labelled envelope, so the question is asked about a field of a record rather than about prose that can imitate its surroundings. `scanState()` reports signals — override attempts, role markers, bidi and zero-width smuggling, structure escapes — and the decision service runs it on every review by default. A confident signal removes eligibility; it never blocks outright, so a false positive reaches a human instead of vanishing. Weak signals (a long digest, a base64-looking identifier) are recorded and change nothing.
+
+The bundled suite covers every surface untrusted text actually arrives on, plus benign controls so false positives are measured too:
+
+```bash
+node bin/jevsql.mjs control adversarial
+```
+
+Neither mechanism is a security boundary. Parameterised statements, database roles and row-level security remain the controls.
+
+### Measuring before you trust a threshold
+
+This is the part that decides whether any of the above is worth switching on.
+
+```bash
+node bin/jevsql.mjs control corpus --store corpus.db
+node bin/jevsql.mjs control promote workflow.json --store corpus.db
+```
+
+- **`EvaluationCorpus`** stores one record per decision with the fields an evaluation actually needs: engine and version, schema version, model id, prompt-template version, state hash, question id and type, the probabilities, the code decision, the adjudicated gold label, the operational outcome, latency and input tokens. `recordReceipt()` files a control-plane receipt directly, so the corpus is a by-product of reviewing rather than a separate chore.
+- **A case's split is derived from its identifier**, so it cannot be chosen after the answers are known, and gold labels are append-only with a revision.
+- **`ShadowRunner`** scores a policy alongside production and returns nothing actionable — no permit, no eligibility — while recording what it *would* have done and whether that agreed.
+- **`promotionStatus`** reports the highest rung the evidence supports: offline evaluation → shadow scoring → advisory → low-risk routing → high-confidence read-only. The ladder is ordered, so good evidence at a later rung cannot skip an earlier one, and **broad automation is never granted** — that needs a separately reviewed control layer this function cannot observe.
+- **`qualifyRelease`** enforces safety *and* usefulness: a policy that blocks every case has no false allows and still cannot pass.
+
+A `pass` is evidence about the supplied sample. It is not proof of future accuracy.
 
 ### Tenant scope must be declared
 
@@ -245,11 +307,21 @@ new GovernedQueries({ service, adapter, templates, tenantColumns: {
 
 A table with a `tenant_id` column is recognised automatically, whatever its letter case. Anything else is an error rather than a silently unfiltered query. This is a compiler guardrail, not a substitute for row-level security in the database itself.
 
-### Measuring before you trust a threshold
+`jevsql/metrics` supplies the measurements underneath: confusion matrices, Brier score, expected calibration error, reliability bins, Wilson intervals, and per-group breakdowns by dialect, schema version, template version and model.
 
-`jevsql/metrics` evaluates labeled cases: confusion matrices, Brier score, expected calibration error, reliability bins, Wilson intervals, and per-group breakdowns by dialect, schema version, template version and model.
+### Paying for it
 
-`qualifyRelease` enforces a release policy on a declared holdout split. It checks safety *and* usefulness: a policy that blocks every case has no false allows and still cannot pass, because `falseBlockRate` and `safeAllowRate` are checked on the safe cases. Passing is evidence about the supplied sample, not proof of future accuracy.
+`jevsql/escalation` routes work through tiers and reports what each one actually handled:
+
+```js
+const router = new CascadingRouter({ tiers: [
+  decisionTier({ service, policy, buildState, costPerCallUsd: 0.00042 }),
+  { name: 'generative-model', costPerCallUsd: 0.05, handle: askTheBigModel },
+  humanTier({ queue }),
+] });
+```
+
+A confident verdict settles a case; an unconfident one can only escalate. A tier that throws escalates rather than failing the request. The report gives the measured escalation rate and cost per case, not a projection — `cascadeEconomics` compares that against sending everything to the expensive tier, and will happily tell you the cascade is not worth it.
 
 ## Data and operating boundaries
 
@@ -262,6 +334,18 @@ The collect rewrite is a conservative SQL text transform, not a full SQL optimiz
 To discover which judgments a query needs, the collect pass stops judgment predicates from filtering, including inside nested groups, so a predicate such as `(tenant_id = 1 AND jev_bool(...))` keeps filtering on the tenant. A clause it cannot split that way — a top-level `OR`, `BETWEEN` or `CASE` — is relaxed whole, which means rows the query excludes are still sent for judgment. Those rows never reach the caller, but they do leave the process. `stats.widened` names any clause this happened to, and `strictCollect: true` refuses such a query instead. Put an authorization predicate in a subquery or CTE rather than relying on the rewrite.
 
 Keep arithmetic, date comparisons, access control, and actual writes in code. Jev’s own [known limitations](https://docs.typesafe.ai/model-jaggedness/jev-1.13) include numeric precision, indirect questions, distracting state, and adversarial text. The passage example includes an advisory suspicious-content signal; it is not a security boundary.
+
+### What this project has not established
+
+The software is tested; the claims a deployment would rest on are not. Being specific about the difference:
+
+- **No adjudicated corpus ships here.** The harness exists and is tested, but no accuracy, calibration, precision or reviewer-time figure has been measured on real data. Every such target remains open.
+- **The remote adapters are tested with fake drivers.** Restricted roles, transaction behaviour, statement timeouts, migration replay and rollback have not been exercised against a live PostgreSQL or MySQL server, and CI does not provision one.
+- **Replay, seeding and index measurement run on SQLite.** They prove behaviour on the supplied fixtures and the current data volume, not on a production system.
+- **Remote schema snapshots stay narrower than local ones.** Optional catalogs are collected when the server answers and listed in `unavailableCatalogs` when it does not.
+- **Lineage discovery from SQL text is lexical.** Every edge it proposes is marked `discovered` and should be confirmed before being treated as fact.
+
+The [implementation audit](docs/implementation-audit-2026-09-19.md) keeps the current version of this list.
 
 ## Recipes, research, and validation
 

@@ -3,6 +3,7 @@ import { JevClient, USD_PER_INPUT_TOKEN } from './client.mjs';
 import { JudgmentCache } from './cache.mjs';
 import { integer, nonNegative, probability, validateAnswer } from './validation.mjs';
 import { digest, jsonData, redactQuestions, redactState } from './privacy.mjs';
+import { scanState } from './injection.mjs';
 
 const bytes = (value) => Buffer.byteLength(JSON.stringify(value), 'utf8');
 const text = (value, name) => {
@@ -72,7 +73,9 @@ export class DecisionService {
     maxJudgments = 1000, maxRequestBytes = 60000, maxQuestionsPerRequest = 120,
     maxEstimatedCostUsd = 0.10, sessionEstimatedBudgetUsd = 1, concurrency = 4,
     cacheTtlMs = 86400000, circuitFailures = 3, circuitCooldownMs = 30000,
-    requirePinnedModel = true, inputTokenPrice = USD_PER_INPUT_TOKEN, now = Date.now, ...clientOptions } = {}) {
+    requirePinnedModel = true, scanUntrusted = true,
+    inputTokenPrice = USD_PER_INPUT_TOKEN, now = Date.now, ...clientOptions } = {}) {
+    this.scanUntrusted = Boolean(scanUntrusted);
     this.model = text(model ?? client?.model ?? 'jev-1.13.0', 'model');
     if (requirePinnedModel && /(?:latest|preview)$/i.test(this.model)) throw new Error('Use a versioned model for qualified database reviews.');
     if (client?.model && client.model !== this.model) throw new Error('Service and client models must match.');
@@ -108,6 +111,11 @@ export class DecisionService {
     }
     integer(cacheTtlMs, 'cacheTtlMs', 0);
     const { state, redactions, omittedFields } = redactState(inputState, this.privacy);
+    // Evidence that is shaped like an instruction cannot produce an automatic
+    // allow. The finding is added on the same path as any other, so the rule
+    // holds for every workflow rather than only the ones that remember to ask.
+    const untrusted = this.scanUntrusted ? scanState(state) : { findings: [], locations: [], score: 0, suspicious: false };
+    if (untrusted.findings.length) safeFindings.push(...untrusted.findings);
     const started = performance.now(), createdAt = new Date(this.now()).toISOString();
     const policyHash = digest(policy), stateHash = digest(state);
     const key = digest(['jevsql-review-v1', this.model, policyHash, stateHash, safeContext]);
@@ -119,7 +127,9 @@ export class DecisionService {
       const receipt = { id: randomUUID(), kind: policy.id, policyVersion: policy.version, policyHash,
         requestedModel: this.model, resolvedModel: resolvedModel ?? null, stateHash, context: safeContext,
         createdAt, source, ...outcome, answers, findings: safeFindings,
-        privacy: { redactions: redactions + questionRedactions, questionRedactions, omittedFields }, stats,
+        privacy: { redactions: redactions + questionRedactions, questionRedactions, omittedFields },
+        untrustedContent: { suspicious: untrusted.suspicious, score: untrusted.score,
+          locations: untrusted.locations.map(({ path, score, signals }) => ({ path, score, codes: signals.map((signal) => signal.code) })) }, stats,
         ...(includeEvidence ? { evidence: state, questions: policy.questions } : {}) };
       if (this.store) await this.store.append(receipt);
       return receipt;

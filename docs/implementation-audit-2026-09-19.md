@@ -46,16 +46,36 @@ Document A ranks the typed guardrail proxy first of ten, and document C describe
 - **Three further review presets** named in document B and absent before: `orm` for already-counted N+1 and model/schema mismatch evidence, `cost` for grouping measured spend by business purpose and spotting redundant workloads, and `secrets` for the ambiguous prose that regular expressions cannot settle.
 - The guardrail is exposed as `jevsql control statement` and is exercised in the offline control demo.
 
+## Second pass: the remaining capability map
+
+A later pass built out the workflows the first pass had listed as missing. Each is deterministic where the documents say it must be, and each is covered by tests.
+
+| Capability | Where | What it establishes |
+| --- | --- | --- |
+| Migration replay, test packs, rollback verification | [migration-runner.mjs](../src/migration-runner.mjs) | Proves the DDL produces the schema the review was written against, runs the named packs, and checks the rollback restores both shape and rows |
+| Application-versus-database type divergence | [app-types.mjs](../src/app-types.mjs) | Deterministic comparison of a declared model against the schema, with only the ambiguous residue reviewed |
+| Evaluation corpus | [corpus.mjs](../src/corpus.mjs) | Document B's per-decision record, with splits derived from the case id and append-only gold labels |
+| Shadow scoring and the promotion ladder | [shadow.mjs](../src/shadow.mjs) | Scores alongside production without returning anything actionable; reports the highest rung the evidence supports |
+| Untrusted-content boundary and adversarial suite | [injection.mjs](../src/injection.mjs) | Structural fencing plus signals that remove eligibility; the bundled suite reaches zero automatic allows with zero false positives on benign controls |
+| Lock graphs, backup and replication posture | [operations.mjs](../src/operations.mjs) | Wait-for cycles, RPO/RTO comparison and lag bucketing, all computed before any review |
+| Semantic metric layer | [semantic-layer.mjs](../src/semantic-layer.mjs) | Metric and dimension selection as bounded decisions, compiled by the existing query compiler |
+| Foreign-key-aware synthetic data | [seed.mjs](../src/seed.mjs) | Topological, seeded generation whose rows the database itself accepts |
+| Index proposal, measurement, property tests | [candidates.mjs](../src/candidates.mjs) | Candidates proposed from access patterns, then built, timed and dropped; rewrites compared on edge-case fixtures |
+| Lineage and sensitivity propagation | [lineage.mjs](../src/lineage.mjs) | Downstream inheritance that contradicts an optimistic catalogue entry |
+| Cascading tiers | [escalation.mjs](../src/escalation.mjs) | Measured escalation rate and cost per case, compared against an expensive-only baseline |
+
+Views and triggers now participate in the schema snapshot, hash and diff, so a replaced view or a new insert-blocking trigger is a detected change. Remote snapshots collect indexes, check constraints, collations, generated columns, views and triggers where the server exposes them, and list what it did not in `unavailableCatalogs`.
+
 ## What is still not done
 
-These remain open, and none of them is a code-level defect. They are the evidence and operational surface the documents propose.
+These remain open. None is a code-level defect; they are the evidence a deployment would rest on.
 
-- **No adjudicated evaluation corpus.** Document B proposes roughly 1,000 cases: 400 request/SQL pairs, 250 migrations, 350 incidents. None exists here. Every accuracy, calibration, precision, recall, reviewer-time and triage-time target in document B is therefore unproven. The harness to measure them is implemented and tested; the measurements have not been taken.
-- **No live PostgreSQL or MySQL verification.** The adapters are tested with fake drivers. Restricted roles, transaction behaviour, cancellation, statement timeouts, migration replay and rollback have not been exercised against a real server, and CI does not provision one.
-- **No shadow pilot.** Document B's promotion ladder — offline evaluation, shadow scoring, advisory, low-risk routing, high-confidence read-only automation — has only its first rung.
-- **Schema extraction stays table-focused.** Views and triggers are outside the snapshot, so replacing a view leaves the hash unchanged. Remote snapshots remain narrower than local ones: they carry columns, primary/unique constraints and foreign keys, but not ordinary indexes, check constraints, generated expressions or collations. Because collation is absent remotely, the F4 proof falls back to treating both sides as the default collation, which is correct for SQLite snapshots and unverified for a MySQL catalog whose columns genuinely differ.
-- **No operational runners.** There is no test-pack runner, migration replay, lock-graph builder, live telemetry collector, catalog or lineage discovery, ETL orchestrator, foreign-key-aware data factory, dialect translator, index benchmarking pipeline or partition/shard implementation. Reviews exist for these; the surrounding workflow does not.
-- **No application or ORM type extraction**, so the app-versus-database type divergence gate in document A's cluster 2 is only half present: the database side is deterministic, the application side is caller-supplied.
+- **No adjudicated evaluation corpus ships here.** Document B proposes roughly 1,000 cases: 400 request/SQL pairs, 250 migrations, 350 incidents. The store, the split discipline, the labelling workflow and the metrics are implemented and tested. The cases do not exist, so every accuracy, calibration, precision, recall, reviewer-time and triage-time target remains unproven. `promotionStatus` reports this rather than hiding it: with no corpus, the ladder sits below its first rung.
+- **No live PostgreSQL or MySQL verification.** The adapters are tested with fake drivers. Restricted roles, transaction behaviour, cancellation and statement timeouts have not been exercised against a real server, and CI does not provision one. Replay, seeding and index measurement run on SQLite, so they establish behaviour on the supplied fixtures and the current data volume, not on a production system.
+- **No shadow pilot has been run.** The runner exists; no production traffic has been scored with it.
+- **Collation is absent from remote snapshots**, so the join-multiplication proof falls back to treating both sides as the default collation. That is correct for SQLite and unverified for a MySQL catalog whose columns genuinely differ.
+- **Lineage discovery from SQL text is lexical.** Every edge it proposes is marked `discovered`; confirming them is a human step.
+- **Still absent:** a live telemetry collector, an ETL orchestrator, a dialect translator (the equivalence gate reviews a translation someone else produced), and partition or shard implementation. Reviews exist for these; the surrounding operational workflow does not.
 
 ## Claims that should not become guarantees
 
