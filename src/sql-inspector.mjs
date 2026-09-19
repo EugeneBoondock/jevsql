@@ -248,8 +248,35 @@ export function inspectQuery(db, input, { params = [], allowedTables, deniedColu
   }
   const allowed = allowedTables == null ? null : new Set(allowedTables.map((name) => (name.includes('.') ? name : `main.${name}`).toLowerCase()));
   for (const table of tables) if (allowed && !allowed.has(table.toLowerCase())) fail('table_not_allowed', `Table ${table} is outside the permitted scope.`);
-  const denied = new Set(deniedColumns.map((name) => (name.split('.').length === 2 ? `main.${name}` : name).toLowerCase()));
-  for (const column of columns) if (denied.has(column.toLowerCase())) fail('column_not_allowed', `Column ${column} is outside the permitted scope.`);
+  /*
+   * A denial has to mean something, whichever way it was written.
+   *
+   * Resolved columns are always three parts, `database.table.column`. Only the
+   * two-part form was completed, so `deniedColumns: ['salary']` normalised to
+   * `salary`, matched nothing, and protected nothing — silently, with no
+   * validation error. A control that quietly does nothing is worse than one
+   * that is absent, because it is in the policy and gets believed.
+   *
+   * `allowedTables` beside this already completes a short name with `main`, so
+   * the shapes are completed the same way here: three parts match exactly, two
+   * gain `main`, and a bare column name denies that column in every table,
+   * which is what somebody writing it means.
+   */
+  const denied = new Set(), deniedInAnyTable = new Set();
+  for (const entry of deniedColumns) {
+    const name = String(entry ?? '').trim();
+    if (!name) throw new TypeError('A denied column needs a name.');
+    const parts = name.split('.');
+    if (parts.length > 3) throw new TypeError(`Denied column ${name} must be column, table.column, or database.table.column.`);
+    if (parts.length === 1) deniedInAnyTable.add(name.toLowerCase());
+    else denied.add((parts.length === 2 ? `main.${name}` : name).toLowerCase());
+  }
+  for (const column of columns) {
+    const resolved = column.toLowerCase();
+    if (denied.has(resolved) || deniedInAnyTable.has(resolved.slice(resolved.lastIndexOf('.') + 1))) {
+      fail('column_not_allowed', `Column ${column} is outside the permitted scope.`);
+    }
+  }
   // A column rule can only be enforced over reads this inspection could name.
   if (denied.size && unresolvedReads) {
     fail('unresolved_column_read', `${unresolvedReads} read(s) could not be resolved to a named column while a column policy applies.`);

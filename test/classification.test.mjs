@@ -127,3 +127,25 @@ test('a review of unparseable SQL is refused rather than thrown', async (t) => {
   assert.ok(review.findings.some((finding) => finding.code === 'unclassified_operation'));
   assert.notEqual(review.requiredApproval, 'none');
 });
+
+test('a denied column is denied however it was written', async (t) => {
+  // Resolved reads are always three parts. Only the two-part form was
+  // completed, so `deniedColumns: ['salary']` matched nothing and protected
+  // nothing — silently. A control that quietly does nothing is worse than an
+  // absent one, because it is in the policy and gets believed.
+  const { DatabaseSync } = await import('node:sqlite');
+  const { inspectQuery } = await import('../src/sql-inspector.mjs');
+  const db = new DatabaseSync(':memory:');
+  t.after(() => db.close());
+  db.exec('CREATE TABLE people(id INTEGER PRIMARY KEY, name TEXT, salary REAL)');
+
+  const blocks = (deniedColumns) => inspectQuery(db, 'SELECT salary FROM people',
+    { deniedColumns, allowedTables: ['people'] }).findings.some((finding) => finding.code === 'column_not_allowed');
+
+  for (const form of [['salary'], ['people.salary'], ['main.people.salary']]) {
+    assert.equal(blocks(form), true, JSON.stringify(form));
+  }
+  assert.equal(blocks(['name']), false, 'a column the query never reads is not a finding');
+  assert.throws(() => blocks(['a.b.c.d']), TypeError, 'an unusable shape is refused, not ignored');
+  assert.throws(() => blocks(['   ']), TypeError);
+});
