@@ -5,6 +5,9 @@
   "type": "module",
   "main": "src/engine.mjs",
   "exports": {
+    "./encryption": "./src/encryption.mjs",
+    "./money": "./src/money.mjs",
+    "./window": "./src/window.mjs",
     "./rows": "./src/rows.mjs",
     "./pg-cache": "./src/pg-cache.mjs",
     ".": "./src/engine.mjs",

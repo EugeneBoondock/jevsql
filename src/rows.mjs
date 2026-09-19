@@ -78,7 +78,9 @@ export async function evaluateRows({ rows, project, questions, namespace, client
   }
   if (pending.length > maxJudgments) throw new RangeError('Row judgment budget exceeded.');
   const batches = packBatches(pending, effectiveLimits);
-  const estimatedInputTokens = estimateTokens(batches);
+  // Provider-side question framing is not visible in serialized payload size.
+  // Pad per judgment; this remains an estimate, never a billing guarantee.
+  const estimatedInputTokens = estimateTokens(batches) + pending.length * 256;
   const estimatedCostUsd = estimatedInputTokens * USD_PER_INPUT_TOKEN;
   if (estimatedCostUsd > maxEstimatedCostUsd) throw new RangeError('Row cost estimate exceeds budget.');
   const stats = { model, rowMode, considered: rows.length, judgments: pending.length,

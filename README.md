@@ -4,6 +4,10 @@
 
 # JevSQL
 
+For exact totals over large or encrypted datasets, use the
+[streaming money API](docs/streaming-money.md). It reads bounded batches and sums
+decimal values by currency without sending money arithmetic to a model.
+
 For PostgreSQL or other already-authorized result sets, use the
 [native row API](docs/native-rows.md): typed decisions, explicit projections,
 tenant-scoped caching, budgets, cancellation, and review queues without SQLite.
