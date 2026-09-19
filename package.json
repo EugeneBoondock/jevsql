@@ -19,6 +19,7 @@
     "./candidates": "./src/candidates.mjs",
     "./corpus": "./src/corpus.mjs",
     "./escalation": "./src/escalation.mjs",
+    "./hazards": "./src/hazards.mjs",
     "./injection": "./src/injection.mjs",
     "./lineage": "./src/lineage.mjs",
     "./migrations": "./src/migration-runner.mjs",
