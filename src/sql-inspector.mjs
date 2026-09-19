@@ -95,13 +95,37 @@ export function classifyStatement(input, { dialect = 'sqlite' } = {}) {
   const masked = maskSql(input);
   const words = [...masked.matchAll(/[A-Za-z_][A-Za-z0-9_]*/g)].map((match) => match[0].toUpperCase());
   const has = (word) => words.includes(word);
-  const head = topLevelWords(input)[0]?.word ?? words[0] ?? null;
+  const outer = topLevelWords(input);
+  const head = outer[0]?.word ?? words[0] ?? null;
   const statementCount = [...masked.matchAll(/;/g)].filter((match) => masked.slice(match.index + 1).trim()).length + 1;
   const changesData = DATA_WRITES.some(has);
   const changesSchema = SCHEMA_WRITES.some(has);
   const changesPermissions = PERMISSION_WRITES.some(has);
-  const filtered = has('WHERE');
-  const limited = has('LIMIT') || has('FETCH') || has('TOP');
+  /*
+   * A WHERE only narrows the statement it belongs to.
+   *
+   * These were a flat search of every word in the statement, so a qualifier
+   * anywhere counted as a qualifier everywhere. A writable CTE puts a whole
+   * separate statement inside parentheses, and
+   *
+   *   WITH recent AS (SELECT id FROM orders WHERE created_at > '2020-01-01')
+   *   DELETE FROM audit_log
+   *
+   * emptied the audit log while reporting destructive: false, unbounded: false
+   * and no reasons at all, because the SELECT's WHERE answered for the DELETE.
+   * `requiredApproval` then dropped from out_of_band_human to human. The same
+   * held for LIMIT inside a CTE in front of an unbounded UPDATE.
+   *
+   * A CTE body is parenthesised, so depth is what separates the two: only a
+   * qualifier at depth 0, positioned after the write keyword it is supposed to
+   * narrow, is that write's own.
+   */
+  const outerAt = (word) => outer.filter((entry) => entry.word === word).map((entry) => entry.start);
+  const writeStart = Math.min(...['DELETE', 'UPDATE', 'INSERT', 'REPLACE', 'UPSERT', 'MERGE', 'TRUNCATE']
+    .flatMap(outerAt).concat(Number.POSITIVE_INFINITY));
+  const qualifies = (word) => outerAt(word).some((start) => start > writeStart);
+  const filtered = qualifies('WHERE');
+  const limited = ['LIMIT', 'FETCH', 'TOP'].some(qualifies);
   const reasons = [];
   if (has('DROP')) reasons.push('drops a schema object');
   if (has('TRUNCATE')) reasons.push('truncates a table');
