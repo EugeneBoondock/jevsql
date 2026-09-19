@@ -9,7 +9,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { verifyMigration, standardPacks } from '../src/migration-runner.mjs';
 import { compareAppTypes, normalizeAppModel, assetsFromAppTypes } from '../src/app-types.mjs';
 import { EvaluationCorpus, splitFor, importCases } from '../src/corpus.mjs';
-import { ShadowRunner, promotionStatus, assessWorkflow, adversarialOutcome } from '../src/shadow.mjs';
+import { ShadowRunner, rescore, promotionStatus, assessWorkflow, adversarialOutcome } from '../src/shadow.mjs';
 import { scanText, scanState, fence, runAdversarialSuite, ADVERSARIAL_CASES } from '../src/injection.mjs';
 import { buildLockGraph, summarizeBackups, summarizeReplication } from '../src/operations.mjs';
 import { SemanticLayer, defineMetric, metricTemplate } from '../src/semantic-layer.mjs';
@@ -213,6 +213,76 @@ test('shadow observation records a verdict without returning anything actionable
   assert.equal(summary.agreementRate, 0);
   assert.equal(corpus.cases({ workflow: 'query' })[0].promptTemplateVersion, 'v2');
   await service.close(); corpus.close();
+});
+
+test('rescore evaluates each labelled case once and records candidate receipts', async () => {
+  const corpus = new EvaluationCorpus();
+  const add = (caseId, questionId, decision, { labelled = true, adversarial = false } = {}) => {
+    corpus.record({ caseId, questionId, workflow: 'query', split: 'tune', questionType: 'noul',
+      answer: { type: 'noul', noul: 0.7 }, decision, adversarial, dbEngine: 'postgresql' });
+    if (labelled) corpus.label(caseId, questionId, { goldLabel: caseId !== 'case-block', adjudicator: 'dba' });
+  };
+  add('case-allow', 'intent', 'block', { adversarial: true });
+  add('case-allow', 'scope', 'review', { adversarial: true });
+  add('case-block', 'intent', 'block');
+  add('case-review', 'intent', 'allow');
+  add('case-skip', 'intent', 'allow');
+  add('case-unlabelled', 'intent', 'allow', { labelled: false });
+
+  const reviewCalls = [];
+  const service = { async review(policy, state, options) {
+    reviewCalls.push({ policy, state, options });
+    const decisions = { 'case-allow': 'eligible', 'case-block': 'block', 'case-review': 'review' };
+    return { id: `receipt-${state.caseId}`, kind: 'query', decision: decisions[state.caseId], policyVersion: '2',
+      answers: { accepted: { type: 'noul', noul: state.caseId === 'case-allow' ? 0.98 : 0.02 } },
+      context: { dialect: 'postgresql' }, stats: { wallMs: 2, inputTokens: 4 } };
+  } };
+  const built = [];
+  const policy = { id: 'candidate', version: '2' };
+  const report = await rescore(service, corpus, { policy, workflow: 'query', promptTemplateVersion: 'v-next',
+    buildState(record) {
+      built.push(record.caseId);
+      return record.caseId === 'case-skip' ? null : { caseId: record.caseId };
+    } });
+
+  assert.deepEqual(built, ['case-allow', 'case-block', 'case-review', 'case-skip'],
+    'Duplicate questions and unlabelled cases do not trigger extra scoring');
+  assert.equal(reviewCalls.length, 3);
+  assert.deepEqual(report.results.map(({ caseId, previousDecision, decision, changed, goldLabel }) =>
+    ({ caseId, previousDecision, decision, changed, goldLabel })), [
+    { caseId: 'case-allow', previousDecision: 'block', decision: 'allow', changed: true, goldLabel: true },
+    { caseId: 'case-block', previousDecision: 'block', decision: 'block', changed: false, goldLabel: false },
+    { caseId: 'case-review', previousDecision: 'allow', decision: 'review', changed: true, goldLabel: true },
+  ]);
+  assert.equal(report.scored, 3);
+  assert.equal(report.changed, 2);
+  assert.equal(typeof report.policyHash, 'string');
+  const candidate = corpus.get('case-allow@v-next', 'accepted');
+  assert.equal(candidate.decision, 'allow');
+  assert.equal(candidate.promptTemplateVersion, 'v-next');
+  assert.equal(candidate.adversarial, true);
+  assert.equal(candidate.dbEngine, 'postgresql');
+  corpus.close();
+});
+
+test('rescore validates configuration and stops before review when aborted', async () => {
+  await assert.rejects(rescore({}, {}, { promptTemplateVersion: 'v1' }), /buildState/);
+  await assert.rejects(rescore({}, {}, { buildState() {}, promptTemplateVersion: ' ' }), /promptTemplateVersion/);
+  await assert.rejects(rescore({}, {}, { buildState() {}, promptTemplateVersion: 'v1', limit: 0 }), /limit/);
+
+  const corpus = new EvaluationCorpus();
+  corpus.record({ caseId: 'abort-me', questionId: 'q', workflow: 'query', split: 'tune', questionType: 'noul',
+    answer: { type: 'noul', noul: 0.5 }, decision: 'review' });
+  corpus.label('abort-me', 'q', { goldLabel: true, adjudicator: 'dba' });
+  const controller = new AbortController();
+  controller.abort();
+  let reviewed = false;
+  await assert.rejects(rescore({ async review() { reviewed = true; } }, corpus, {
+    policy: { id: 'p' }, workflow: 'query', promptTemplateVersion: 'v2', signal: controller.signal,
+    buildState() { return {}; },
+  }), { name: 'AbortError' });
+  assert.equal(reviewed, false);
+  corpus.close();
 });
 
 test('the promotion ladder is ordered and stops before broad automation', () => {

@@ -15,6 +15,9 @@
     "./adapters": "./src/adapters.mjs",
     "./queries": "./src/query-compiler.mjs",
     "./evaluation": "./src/evaluation.mjs",
+    "./function-router": "./src/function-router.mjs",
+    "./date-extraction": "./src/date-extraction.mjs",
+    "./hierarchy": "./src/hierarchy.mjs",
     "./app-types": "./src/app-types.mjs",
     "./candidates": "./src/candidates.mjs",
     "./corpus": "./src/corpus.mjs",
@@ -33,11 +36,22 @@
   "engines": { "node": ">=22.16" },
   "scripts": {
     "test": "node --test \"test/**/*.test.mjs\"",
+    "test:coverage": "node --test --experimental-test-coverage --test-coverage-lines=95 --test-coverage-branches=86 --test-coverage-functions=95 \"test/**/*.test.mjs\"",
+    "test:databases": "node --test test/real-adapters.test.mjs",
+    "test:mutation": "stryker run",
     "demo": "node examples/demo.mjs",
     "control": "node examples/control-plane.mjs",
     "workflows": "node examples/workflows.mjs",
     "showcase": "node examples/showcase.mjs",
     "contrast": "node examples/contrast.mjs"
+  },
+  "devDependencies": {
+    "@stryker-mutator/core": "^10.0.0",
+    "mysql2": "^3.14.5",
+    "pg": "^8.16.3"
+  },
+  "overrides": {
+    "qs": "^6.16.0"
   },
   "keywords": ["typesafe", "jev", "system-one", "sql", "sqlite", "llm", "classification", "semantic-sql", "ai-database"],
   "license": "MIT",

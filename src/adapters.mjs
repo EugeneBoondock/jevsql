@@ -220,6 +220,9 @@ class RemoteAdapter {
         await run("SELECT set_config('lock_timeout',$1,true)", [String(this.statementTimeoutMs)]);
       } else {
         await run('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+        await run('SET SESSION MAX_EXECUTION_TIME=?', [this.statementTimeoutMs]);
+        await run('SET SESSION lock_wait_timeout=?', [Math.max(1, Math.ceil(this.statementTimeoutMs / 1000))]);
+        await run('SET SESSION innodb_lock_wait_timeout=?', [Math.max(1, Math.ceil(this.statementTimeoutMs / 1000))]);
         await run('START TRANSACTION READ ONLY'); began = true;
       }
       const result = await work(run); signal?.throwIfAborted();

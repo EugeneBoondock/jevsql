@@ -50,6 +50,11 @@ for (const dialect of ['postgresql', 'mysql']) {
     assert.ok(h.calls.every((c) => !/EXPLAIN\s+ANALYZE/i.test(c.sql)));
     if (dialect === 'mysql') assert.ok(h.calls.some((c) => c.sql.includes('MAX_EXECUTION_TIME(2000)')));
     else assert.ok(h.calls.some((c) => c.sql.includes("set_config('statement_timeout'")));
+    if (dialect === 'mysql') {
+      assert.ok(h.calls.some((c) => c.sql === 'SET SESSION MAX_EXECUTION_TIME=?' && c.params[0] === 2000));
+      assert.ok(h.calls.some((c) => c.sql === 'SET SESSION lock_wait_timeout=?' && c.params[0] === 2));
+      assert.ok(h.calls.some((c) => c.sql === 'SET SESSION innodb_lock_wait_timeout=?' && c.params[0] === 2));
+    }
   });
 
   test(`${dialect} rolls back failed and cancelled reads before releasing`, async () => {

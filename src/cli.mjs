@@ -32,6 +32,7 @@ OPTIONS
   --cache-namespace <s>  isolate a dataset or force a new set of judgments
   --max-estimated-cost <usd>  stop before batches exceed this estimated query cost
   --concurrency <n>      requests in flight (default: 4)
+  --isolate-rows         send each distinct row in its own request
   --key <column>        stable key for a saved decision table (default: id)
   --revision <n>        filter change history to one refresh
   --limit <n>           change history size (default: 100)
@@ -41,8 +42,8 @@ OPTIONS
   --quiet                only print rows
 
 SQL FUNCTIONS
-  jev_noul(text, question)                      -> probability 0..1 that the answer is yes
-  jev_bool(text, question [, threshold=0.5])    -> 1 or 0
+  jev_noul(text, question [, criteria])          -> probability 0..1 that the answer is yes
+  jev_bool(text, question [, threshold, criteria]) -> 1 or 0
   jev_choice(text, question, options [, minconf]) -> chosen label, NULL below minconf
   jev_choice_conf(text, question, options)      -> confidence 0..1
   jev_prob(text, question, options, label)      -> probability of one label
@@ -51,6 +52,8 @@ SQL FUNCTIONS
   jev_decide(text, question [, low, high])       -> 0, 1, or NULL for review
   jev_match(left, right [, question])           -> probability that records match
   jev_choice_probs(text, question, options)     -> full distribution as JSON
+  jev_choice_top_prob(text, question, options)  -> winning option probability
+  jev_choice_prob_gate(text, question, options [, minprob]) -> label or NULL
   jev_score_norm(text, question, levels)        -> score normalized to 0..1
   jev_score_probs(text, question, levels)       -> full distribution as JSON
   jev_candidates(text, kind)                   -> exact spans, no model call
@@ -86,6 +89,7 @@ function parseArgs(argv) {
       case '--cache-namespace': opts.cacheNamespace = next(); break;
       case '--max-estimated-cost': opts.maxEstimatedCostUsd = nonNegative(Number(next()), 'estimated cost'); break;
       case '--concurrency': opts.concurrency = integer(Number(next()), 'concurrency', 1, 32); break;
+      case '--isolate-rows': opts.rowMode = 'isolated'; break;
       case '--key': opts.key = next(); break;
       case '--revision': opts.revision = integer(Number(next()), 'revision'); break;
       case '--limit': opts.limit = integer(Number(next()), 'limit'); break;
@@ -132,6 +136,7 @@ function openEngine(opts) {
     ...(opts.maxJudgments != null ? { maxJudgments: opts.maxJudgments } : {}),
     ...(opts.model ? { model: opts.model } : {}),
     ...(opts.concurrency ? { concurrency: opts.concurrency } : {}),
+    ...(opts.rowMode ? { rowMode: opts.rowMode } : {}),
     ...(opts.cacheNamespace ? { cacheNamespace: opts.cacheNamespace } : {}),
     ...(opts.maxEstimatedCostUsd != null ? { maxEstimatedCostUsd: opts.maxEstimatedCostUsd } : {}),
   });

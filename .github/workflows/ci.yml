@@ -20,3 +20,63 @@ jobs:
           node-version: ${{ matrix.node }}
       # The suite runs against a mock TypeSafe server, so no API key is needed.
       - run: node --test "test/**/*.test.mjs"
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.x'
+      - run: npm run test:coverage
+
+  real-databases:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: jevsql
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d jevsql"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root-password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -proot-password"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      JEVSQL_REAL_DATABASES: '1'
+      JEVSQL_POSTGRES_ADMIN_URL: postgresql://postgres:postgres@127.0.0.1:5432/jevsql
+      JEVSQL_POSTGRES_READER_URL: postgresql://jevsql_reader:reader-password@127.0.0.1:5432/jevsql
+      JEVSQL_MYSQL_ADMIN_URL: mysql://root:root-password@127.0.0.1:3306/mysql
+      JEVSQL_MYSQL_READER_URL: mysql://jevsql_reader:reader-password@127.0.0.1:3306/app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.x'
+      - run: npm install --ignore-scripts
+      - run: npm run test:databases
+
+  mutation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.x'
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run test:mutation

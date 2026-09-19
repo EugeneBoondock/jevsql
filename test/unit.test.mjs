@@ -6,7 +6,39 @@ import { parseList, judgmentFor, judgmentKey } from '../src/functions.mjs';
 import { parseCsv } from '../src/csv.mjs';
 import { JudgmentCache } from '../src/cache.mjs';
 import { JevClient } from '../src/client.mjs';
+import { integer, nonNegative, probability, quoteIdentifier, validateAnswer } from '../src/validation.mjs';
 import { startMockServer } from './mock-server.mjs';
+
+test('shared validators enforce exact boundaries and SQL identifier escaping', () => {
+  assert.equal(probability(0), 0); assert.equal(probability(1), 1);
+  for (const value of [-Number.EPSILON, 1 + Number.EPSILON, NaN, Infinity, '0']) assert.throws(() => probability(value));
+  assert.equal(integer(2, 'n', 2, 3), 2); assert.equal(integer(3, 'n', 2, 3), 3);
+  for (const value of [1, 4, 2.5, NaN]) assert.throws(() => integer(value, 'n', 2, 3));
+  assert.equal(nonNegative(0, 'n'), 0); assert.throws(() => nonNegative(-Number.EPSILON, 'n'));
+  assert.throws(() => nonNegative(Infinity, 'n')); assert.throws(() => nonNegative('0', 'n'));
+  assert.equal(quoteIdentifier('a"b'), '"a""b"');
+  for (const value of ['', '  ', 1, 'a\0b']) assert.throws(() => quoteIdentifier(value));
+});
+
+test('answer validation rejects each malformed answer dimension', () => {
+  assert.throws(() => validateAnswer(null, { kind: 'noul' }), /type/);
+  assert.throws(() => validateAnswer({ type: 'choice' }, { kind: 'noul' }), /type/);
+  assert.equal(validateAnswer({ type: 'noul', noul: 0 }, { kind: 'noul' }).noul, 0);
+  const choice = { kind: 'choice', criteria: ['a', 'b'] };
+  const base = { type: 'choice', choice: 'a', confidence: 1, probabilities: { a: 0.6, b: 0.4 } };
+  assert.equal(validateAnswer(base, choice).choice, 'a');
+  assert.throws(() => validateAnswer({ ...base, confidence: 2 }, choice));
+  assert.throws(() => validateAnswer({ ...base, probabilities: null }, choice));
+  assert.throws(() => validateAnswer({ ...base, probabilities: [] }, choice));
+  assert.throws(() => validateAnswer({ ...base, probabilities: { a: 0.6 } }, choice));
+  assert.throws(() => validateAnswer({ ...base, probabilities: { a: 0.7, b: 0.4 } }, choice));
+  assert.throws(() => validateAnswer({ ...base, choice: 'c' }, choice));
+  assert.throws(() => validateAnswer({ ...base, choice: 'b' }, choice));
+  const score = { kind: 'score', criteria: ['low', 'high'] };
+  assert.equal(validateAnswer({ type: 'score', score: 0.4, confidence: 1, probabilities: { 0: 0.6, 1: 0.4 } }, score).score, 0.4);
+  for (const value of [-1, 2, NaN, '0.4']) assert.throws(() => validateAnswer(
+    { type: 'score', score: value, confidence: 1, probabilities: { 0: 0.6, 1: 0.4 } }, score));
+});
 
 test('relax keeps ordinary filters and neutralises jev conjuncts', () => {
   const { sql, relaxed } = relaxForCollect(
@@ -123,6 +155,7 @@ test('client retries a 503 and then succeeds', async () => {
     apiKey: 'k',
     baseUrl: 'http://example.invalid',
     maxAttempts: 3,
+    sleepImpl: async () => {},
     fetchImpl: async () => {
       attempts += 1;
       if (attempts < 3) return new Response('busy', { status: 503 });
@@ -133,6 +166,53 @@ test('client retries a 503 and then succeeds', async () => {
   assert.equal(data.answers.a.noul, 1);
   assert.equal(attempts, 3);
   assert.equal(client.stats.retries, 2);
+});
+
+test('client honors retry headers for 429 and 529 without real waits', async () => {
+  const waits = [];
+  const now = Date.parse('2026-09-19T10:00:00Z');
+  const responses = [
+    new Response('limited', { status: 429, headers: { 'Retry-After': '2.5' } }),
+    new Response('busy', { status: 529, headers: { 'Retry-After': 'Sat, 19 Sep 2026 10:00:04 GMT' } }),
+    new Response(JSON.stringify({ answers: { q: { type: 'noul', noul: 1 } } }), { status: 200 }),
+  ];
+  const client = new JevClient({ apiKey: 'k', baseUrl: 'http://example.invalid', maxAttempts: 3,
+    now: () => now, sleepImpl: async (ms) => waits.push(ms), fetchImpl: async () => responses.shift() });
+  await client.evaluate({}, { q: { type: 'noul', instructions: 'q' } });
+  assert.deepEqual(waits, [2500, 4000]);
+  assert.equal(client.stats.retries, 2);
+});
+
+test('client rejects malformed JSON, missing ids, and exhausted timeouts', async () => {
+  let malformedCalls = 0;
+  const malformed = new JevClient({ apiKey: 'k', maxAttempts: 3, sleepImpl: async () => {},
+    fetchImpl: async () => { malformedCalls++; return new Response('{', { status: 200 }); } });
+  await assert.rejects(() => malformed.evaluate({}, { q: {} }), SyntaxError);
+  assert.equal(malformedCalls, 1);
+
+  const missing = new JevClient({ apiKey: 'k', fetchImpl: async () => new Response(JSON.stringify({ answers: {} }), { status: 200 }) });
+  await assert.rejects(() => missing.evaluate({}, { q: {} }), /answer ids/);
+
+  let timeoutCalls = 0;
+  const timed = new JevClient({ apiKey: 'k', maxAttempts: 2, sleepImpl: async () => {},
+    fetchImpl: async () => { timeoutCalls++; throw new DOMException('timed out', 'TimeoutError'); } });
+  await assert.rejects(() => timed.evaluate({}, {}), /timed out/);
+  assert.equal(timeoutCalls, 2);
+  assert.equal(timed.stats.retries, 1);
+});
+
+test('client lists models with an authenticated GET', async () => {
+  let observed;
+  const client = new JevClient({ apiKey: 'secret', baseUrl: 'https://typesafe.invalid', fetchImpl: async (url, init) => {
+    observed = { url, init };
+    return new Response(JSON.stringify({ data: [{ id: 'jev-1.13.0' }] }), { status: 200 });
+  } });
+  const models = await client.listModels();
+  assert.equal(models.data[0].id, 'jev-1.13.0');
+  assert.equal(observed.url, 'https://typesafe.invalid/v1/models');
+  assert.equal(observed.init.method, 'GET');
+  assert.equal(observed.init.headers.Authorization, 'Bearer secret');
+  assert.equal('body' in observed.init, false);
 });
 
 test('client does not retry an auth failure', async () => {

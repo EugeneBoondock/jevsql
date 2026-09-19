@@ -187,6 +187,22 @@ test('denied columns are detected through rowid aliases and WITHOUT ROWID layout
   db.close();
 });
 
+test('query inspection maps covering indexes and refuses virtual table sources', () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(`CREATE TABLE indexed(id INTEGER PRIMARY KEY, tenant_id TEXT, public TEXT, secret TEXT);
+    CREATE INDEX indexed_cover ON indexed(tenant_id, secret, public);
+    INSERT INTO indexed VALUES(1, 'a', 'shown', 'hidden');`);
+  const plan = inspectQuery(db, "SELECT secret FROM indexed INDEXED BY indexed_cover WHERE tenant_id='a'", {
+    deniedColumns: ['indexed.secret'],
+  });
+  assert.ok(plan.findings.some((finding) => finding.code === 'column_not_allowed'));
+  assert.ok(plan.columns.includes('main.indexed.secret'));
+
+  const virtual = inspectQuery(db, "SELECT value FROM json_each('[1,2]')");
+  assert.ok(virtual.findings.some((finding) => finding.code === 'virtual_source'));
+  db.close();
+});
+
 // F6: a contradictory Choice answer must not be able to satisfy a gate.
 test('a choice that is not its own highest-probability option is rejected', () => {
   const question = { kind: 'choice', criteria: { routine_read: 'ok', ambiguous: 'unclear' } };
@@ -195,6 +211,16 @@ test('a choice that is not its own highest-probability option is rejected', () =
   // A tie within tolerance stays acceptable.
   assert.doesNotThrow(() => validateAnswer({ type: 'choice', choice: 'routine_read', confidence: 0.5,
     probabilities: { routine_read: 0.5, ambiguous: 0.5 } }, question));
+});
+
+// The API defines Score as the probability-weighted position across the rubric.
+// A contradictory value must not be cached or exposed as a trustworthy score.
+test('a score that disagrees with its probability distribution is rejected', () => {
+  const question = { kind: 'score', criteria: ['low', 'medium', 'high'] };
+  assert.throws(() => validateAnswer({ type: 'score', score: 0, confidence: 0.8,
+    probabilities: { 0: 0.1, 1: 0.2, 2: 0.7 } }, question), /probability-weighted/);
+  assert.doesNotThrow(() => validateAnswer({ type: 'score', score: 1.6, confidence: 0.8,
+    probabilities: { 0: 0.1, 1: 0.2, 2: 0.7 } }, question));
 });
 
 // F7: a human label decides what a receipt meant, so edits to it must be detected.

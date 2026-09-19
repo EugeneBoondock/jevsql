@@ -30,3 +30,66 @@ export function evaluatePredictions(rows, { expected = 'expected', predicted = '
   }
   return { total: rows.length, thresholds: sweep, confusion: [...confusion.values()] };
 }
+
+/** Compare the same query result under packed and isolated row requests. */
+export function compareRowModes(packedResult, isolatedResult, { key = 'id', fields } = {}) {
+  const packed = packedResult?.rows;
+  const isolated = isolatedResult?.rows;
+  if (!Array.isArray(packed) || !Array.isArray(isolated)) {
+    throw new TypeError('Row-mode comparison needs packed and isolated query results.');
+  }
+  const index = (rows, name) => {
+    const result = new Map();
+    for (const row of rows) {
+      if (!(key in row) || row[key] == null) throw new TypeError(`Every ${name} row needs a non-null ${key}.`);
+      const id = JSON.stringify(row[key]);
+      if (result.has(id)) throw new TypeError(`${name} row keys must be unique.`);
+      result.set(id, row);
+    }
+    return result;
+  };
+  const left = index(packed, 'packed');
+  const right = index(isolated, 'isolated');
+  if (left.size !== right.size || [...left.keys()].some((id) => !right.has(id))) {
+    throw new TypeError('Packed and isolated results must contain the same row keys.');
+  }
+  const selected = fields ?? [...new Set(packed.flatMap((row) => Object.keys(row)))]
+    .filter((name) => name !== key && isolated.every((row) => name in row));
+  if (!Array.isArray(selected) || !selected.length || selected.some((name) => typeof name !== 'string' || name === key)) {
+    throw new TypeError('Comparison fields must be a non-empty array of column names other than the key.');
+  }
+
+  const differences = [];
+  const numericDeltas = [];
+  for (const [id, packedRow] of left) {
+    const isolatedRow = right.get(id);
+    for (const field of selected) {
+      if (!(field in packedRow) || !(field in isolatedRow)) throw new TypeError(`Missing comparison field ${field}.`);
+      const packedValue = packedRow[field];
+      const isolatedValue = isolatedRow[field];
+      const equal = Object.is(packedValue, isolatedValue);
+      const numeric = typeof packedValue === 'number' && Number.isFinite(packedValue)
+        && typeof isolatedValue === 'number' && Number.isFinite(isolatedValue);
+      const absoluteDelta = numeric ? Math.abs(packedValue - isolatedValue) : null;
+      if (numeric) numericDeltas.push(absoluteDelta);
+      if (!equal) differences.push({ key: packedRow[key], field, packed: packedValue, isolated: isolatedValue, absoluteDelta });
+    }
+  }
+  const compared = left.size * selected.length;
+  const differingRows = new Set(differences.map((item) => JSON.stringify(item.key))).size;
+  const stats = (result) => ({ requests: result?.stats?.requests ?? null, inputTokens: result?.stats?.inputTokens ?? null,
+    costUsd: result?.stats?.costUsd ?? null, wallMs: result?.stats?.wallMs ?? null });
+  return {
+    rows: left.size,
+    fields: selected,
+    compared,
+    agreements: compared - differences.length,
+    agreementRate: compared ? (compared - differences.length) / compared : null,
+    differingRows,
+    fieldDisagreements: differences.length,
+    maxNumericDelta: numericDeltas.length ? Math.max(...numericDeltas) : null,
+    meanNumericDelta: numericDeltas.length ? numericDeltas.reduce((sum, value) => sum + value, 0) / numericDeltas.length : null,
+    differences,
+    stats: { packed: stats(packedResult), isolated: stats(isolatedResult) },
+  };
+}

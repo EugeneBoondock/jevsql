@@ -31,7 +31,9 @@ export class WorkflowFixtureClient {
       } else {
         const matched = row?.left && row?.right && row.left.name.startsWith('Acme') && row.right.name.startsWith('Acme');
         const suspicious = typeof row === 'string' && row.includes('ignore');
-        answers[id] = { type: 'noul', noul: matched || suspicious ? 0.97 : 0.03 };
+        const answerExists = row?.passage && String(q.instructions.question).includes('contain information')
+          && row.passage.includes('within 30 days');
+        answers[id] = { type: 'noul', noul: matched || suspicious || answerExists ? 0.97 : 0.03 };
       }
     }
     this.stats.requests++;

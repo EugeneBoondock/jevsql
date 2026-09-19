@@ -22,7 +22,7 @@ import { findCandidates } from './decisions.mjs';
 import { bindAll, readQuery } from './sql.mjs';
 import { integer, nonNegative, validateAnswer } from './validation.mjs';
 import { materialize, refresh, decisionTables, changeHistory, check } from './workflows.mjs';
-import { evaluatePredictions } from './evaluation.mjs';
+import { compareRowModes, evaluatePredictions } from './evaluation.mjs';
 
 export class JevSQL {
   /**
@@ -30,14 +30,17 @@ export class JevSQL {
    * @param {string} [options.db] SQLite file (default in-memory)
    * @param {string} [options.cacheFile] where to persist judgments
    * @param {number} [options.maxJudgments] refuse to spend more than this per query
+   * @param {'packed'|'isolated'} [options.rowMode] whether unrelated rows may share request state
    */
-  constructor({ db = ':memory:', cacheFile = null, maxJudgments = 1000, client, cache, limits = {}, maxRounds = 8,
+  constructor({ db = ':memory:', cacheFile = null, maxJudgments = 1000, client, cache, limits = {}, rowMode = 'packed', maxRounds = 8,
     concurrency = 4, maxEstimatedCostUsd = null, cacheNamespace = '', strictCollect = false, ...clientOptions } = {}) {
     integer(maxJudgments, 'maxJudgments', 0);
     integer(maxRounds, 'maxRounds');
     integer(concurrency, 'concurrency', 1, 32);
     if (maxEstimatedCostUsd != null) nonNegative(maxEstimatedCostUsd, 'maxEstimatedCostUsd');
-    packBatches([], limits);
+    if (!['packed', 'isolated'].includes(rowMode)) throw new TypeError('rowMode must be packed or isolated.');
+    const effectiveLimits = rowMode === 'isolated' ? { ...limits, maxRowsPerRequest: 1 } : limits;
+    packBatches([], effectiveLimits);
     this.model = clientOptions.model ?? client?.model ?? process.env.TYPESAFE_DEFAULT_MODEL ?? 'jev-latest';
     if (client?.model && client.model !== this.model) throw new Error('Engine model and client model must match.');
     this.db = new DatabaseSync(db);
@@ -46,7 +49,8 @@ export class JevSQL {
     this.clientOptions = clientOptions;
     this.maxJudgments = maxJudgments;
     this.maxRounds = maxRounds;
-    this.limits = limits;
+    this.limits = effectiveLimits;
+    this.rowMode = rowMode;
     this.concurrency = concurrency;
     this.maxEstimatedCostUsd = maxEstimatedCostUsd;
     this.cacheNamespace = cacheNamespace;
@@ -132,7 +136,7 @@ export class JevSQL {
     signal?.throwIfAborted();
     this.#signal = signal; this.#audit = audit; this.#trace = new Map();
     const started = performance.now();
-    const stats = { rounds: 0, judgments: 0, cacheHits: 0, requests: 0, inputTokens: 0, costUsd: 0, relaxed: [], widened: [], apiMs: 0, estimatedCostUsd: 0, model: this.model };
+    const stats = { rounds: 0, judgments: 0, cacheHits: 0, requests: 0, inputTokens: 0, costUsd: 0, relaxed: [], widened: [], apiMs: 0, estimatedCostUsd: 0, model: this.model, rowMode: this.rowMode };
 
     const { sql: collectSql, relaxed, widened } = relaxForCollect(sql);
     stats.relaxed = relaxed;
@@ -297,4 +301,4 @@ export class JevSQL {
 }
 
 export { USD_PER_INPUT_TOKEN };
-export { evaluatePredictions };
+export { compareRowModes, evaluatePredictions };

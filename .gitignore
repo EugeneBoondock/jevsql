@@ -2,6 +2,7 @@
 .env.*
 !.env.example
 node_modules/
+.stryker-tmp/
 *.log
 
 # judgment caches (may contain your data)

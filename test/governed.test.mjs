@@ -111,6 +111,33 @@ test('compiler produces dialect-specific bindings and cannot accept raw SQL or f
   assert.throws(() => parameterValue('2026-02-30', { type: 'date' }, 'date'), /real ISO date/);
 });
 
+test('compiler rejects malformed selections, filters, grouping, and ordering before SQL execution', (t) => {
+  const { adapter } = fixture(t), schema = adapter.snapshot();
+  const compile = (query, params = {}, declarations = {}) => compileTemplate({
+    id: 'edge', version: '1', description: 'Compiler edge cases', roles: ['analyst'], params: declarations, query,
+  }, schema, { actor: ACTOR, params });
+  const base = { from: 'orders', select: [{ column: 'id', as: 'id' }] };
+
+  assert.throws(() => compile({ ...base, select: [{ column: 'id', as: 'same' }, { column: 'total', as: 'SAME' }] }), /distinct/);
+  assert.throws(() => compile({ ...base, select: [{ column: 'total', as: 'x', aggregate: 'median' }] }), /aggregate/);
+  assert.throws(() => compile({ ...base, select: [{ column: '*', as: 'x', aggregate: 'count', distinct: true }] }), /needs a column/);
+  assert.throws(() => compile({ ...base, select: [{ column: 'id', as: 'id', distinct: true }] }), /only supported/);
+  assert.throws(() => compile({ ...base, select: [{ column: 'id', as: 'id' }, { column: 'total', as: 'sum', aggregate: 'sum' }] }), /groupBy/);
+
+  const nullDecl = { value: { type: 'number', nullable: true } };
+  assert.throws(() => compile({ ...base, filters: [{ column: 'total', op: 'isNull', param: 'value' }] }, { value: null }, nullDecl), /do not accept/);
+  assert.throws(() => compile({ ...base, filters: [{ column: 'total', op: 'eq', param: 'value' }] }, { value: null }, nullDecl), /explicit isNull/);
+  assert.throws(() => compile({ ...base, filters: [{ column: 'total', op: 'eq', param: 'missing' }] }), /Undeclared/);
+  assert.throws(() => compile({ ...base, filters: [{ column: 'total', op: 'bad', param: 'value' }] }, { value: 1 }, { value: { type: 'number' } }), /operator/);
+  assert.throws(() => compile({ ...base, orderBy: [{ column: 'missing' }] }), /selected output alias/);
+  assert.throws(() => compile({ ...base, orderBy: [{ column: 'id', direction: 'sideways' }] }), /asc or desc/);
+
+  const inQuery = compile({ ...base, filters: [{ column: 'id', op: 'in', param: 'ids' }] }, { ids: [1, 3] },
+    { ids: { type: 'array', items: { type: 'integer' }, maxItems: 5 } });
+  assert.match(inQuery.sql, /IN \(\?, \?\)/);
+  assert.deepEqual(inQuery.values, ['a', 1, 3, 100]);
+});
+
 test('concurrent attempts cannot reuse a permit while the adapter is awaiting IO', async (t) => {
   const { gate, adapter } = fixture(t);
   const original = adapter.read.bind(adapter);

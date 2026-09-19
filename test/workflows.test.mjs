@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { JevSQL } from '../src/engine.mjs';
-import { evaluatePredictions } from '../src/evaluation.mjs';
+import { compareRowModes, evaluatePredictions } from '../src/evaluation.mjs';
 import { fixture, routeSql } from './helpers.mjs';
 
 test('decision table refresh pays only for changed inputs and logs added, updated, removed rows', async (t) => {
@@ -108,6 +108,23 @@ test('evaluation reports exact coverage and accuracy, with null when none accept
   assert.equal(report.thresholds[2].review, 3);
   assert.throws(() => evaluatePredictions([{ prediction: 'a', confidence: 1 }]), /ground truth/);
   assert.throws(() => evaluatePredictions([]), /labeled/);
+});
+
+test('row-mode comparison reports disagreements, probability movement, and request costs', () => {
+  const packed = { rows: [{ id: 1, label: 'a', probability: 0.8 }, { id: 2, label: 'b', probability: 0.6 }],
+    stats: { requests: 1, inputTokens: 100, costUsd: 0.01, wallMs: 10 } };
+  const isolated = { rows: [{ id: 2, label: 'a', probability: 0.55 }, { id: 1, label: 'a', probability: 0.8 }],
+    stats: { requests: 2, inputTokens: 140, costUsd: 0.014, wallMs: 12 } };
+  const report = compareRowModes(packed, isolated);
+  assert.equal(report.rows, 2);
+  assert.equal(report.compared, 4);
+  assert.equal(report.fieldDisagreements, 2);
+  assert.equal(report.differingRows, 1);
+  assert.equal(report.agreementRate, 0.5);
+  assert.ok(Math.abs(report.maxNumericDelta - 0.05) < 1e-12);
+  assert.equal(report.stats.isolated.requests, 2);
+  assert.throws(() => compareRowModes(packed, { rows: [{ id: 3, label: 'a' }] }), /same row keys/);
+  assert.throws(() => compareRowModes({ rows: [{ id: 1 }, { id: 1 }] }, { rows: [] }), /unique/);
 });
 
 test('SQL evaluation sweeps thresholds without additional model requests', async (t) => {

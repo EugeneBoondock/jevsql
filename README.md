@@ -120,6 +120,7 @@ const engine = new JevSQL({
   cacheNamespace: 'routing-policy-v1',
   maxJudgments: 500,
   maxEstimatedCostUsd: 0.02,
+  rowMode: 'packed', // use 'isolated' to send one distinct row per request
 });
 
 try {
@@ -145,18 +146,20 @@ Use `materialize(name, sql, { dryRun: true })` to estimate a save without creati
 
 | Function | Result |
 |---|---|
-| `jev_noul(text, question)` | Yes-probability in `[0, 1]`. |
-| `jev_bool(text, question [, threshold])` | `1` when probability is at least the threshold, otherwise `0`. Default `0.5`. |
-| `jev_decide(text, question [, low, high])` | `0` below `low`, `1` above `high`, otherwise `NULL`. Defaults `0.1` and `0.9`; both boundaries remain in review. |
+| `jev_noul(text, question [, criteria])` | Yes-probability in `[0, 1]`. Optional criteria is a JSON object defining `true` and `false`. |
+| `jev_bool(text, question [, threshold, criteria])` | `1` when probability is at least the threshold, otherwise `0`. Default `0.5`. |
+| `jev_decide(text, question [, low, high, criteria])` | `0` below `low`, `1` above `high`, otherwise `NULL`. Defaults `0.1` and `0.9`; both boundaries remain in review. |
 | `jev_choice(text, question, options [, min_confidence])` | Selected label, or `NULL` below the confidence threshold. Default `0`. |
 | `jev_choice_conf(text, question, options)` | Provider-reported confidence. |
 | `jev_choice_probs(text, question, options)` | Complete probability distribution as JSON. |
+| `jev_choice_top_prob(text, question, options)` | Probability assigned to the winning label. |
+| `jev_choice_prob_gate(text, question, options [, min_probability])` | Winning label, or `NULL` when its probability is below the threshold. Default `0.8`. |
 | `jev_prob(text, question, options, label)` | Probability of a supplied label. Unknown labels are rejected. |
 | `jev_score(text, question, levels)` | Position across descriptive levels, possibly fractional. |
 | `jev_score_norm(text, question, levels)` | Score divided by the number of intervals, in `[0, 1]`. |
 | `jev_score_conf(text, question, levels)` | Provider-reported confidence. |
 | `jev_score_probs(text, question, levels)` | Distribution across level indexes as JSON. |
-| `jev_match(left, right [, question])` | Probability that two records match under the supplied question. |
+| `jev_match(left, right [, question, criteria])` | Probability that two records match under the supplied question. |
 | `jev_candidates(text [, kind])` | JSON array of exact spans. No model call. Kinds: `email`, `phone`, `money`, `url`, `line`; default `email`. |
 | `jev_pick(text, question, candidates [, min_confidence])` | Exact supplied span or `NULL`. Default confidence threshold `0.8`. |
 | `jev_pick_conf(text, question, candidates)` | Confidence from the same selection answer. |
@@ -166,6 +169,14 @@ All model functions propagate a missing source as SQL `NULL`. Empty candidate li
 Functions reading the same judgment share one API question. Selecting a label, its confidence, its distribution, and one label probability costs one judgment between them. Noul, Bool, and Decide likewise share an answer. Different question types remain distinct.
 
 Options accept JSON arrays, comma-separated or pipe-separated labels, or a JSON object mapping labels to descriptions. Choice supports 2–255 distinct labels. Score supports 2–10 ordered levels, including structured descriptions. Questions can also be JSON objects. See the [TypeSafe primitives](https://docs.typesafe.ai/primitives) and [structured rubrics](https://docs.typesafe.ai/primitives/advanced).
+
+Noul criteria must define both outcomes. The same criteria object can be shared by `jev_noul`, `jev_bool`, and `jev_decide`, so those projections reuse one answer.
+
+```sql
+SELECT jev_decide(body, 'Is this a billing dispute?', 0.1, 0.9,
+  '{"true":"The customer disputes an invoice, charge, refund, or payment.","false":"The message concerns another topic."}')
+FROM tickets;
+```
 
 ```sql
 SELECT id,
@@ -229,7 +240,16 @@ node bin/jevsql.mjs evaluate --file labeled-query.sql --db data.db
 
 The report shows accepted rows, errors, accuracy, coverage, and review count across seven thresholds, plus a confusion table. No extra model calls are needed for the threshold sweep. Missing predictions count as abstentions. Accuracy is `null` when no rows are accepted. Use separate validation data before choosing a production threshold.
 
-The library also exports `evaluatePredictions(rows, options)` for existing predictions and supports custom column names and thresholds. Model confidence and the probability of one label are different quantities; neither substitutes for measured task accuracy. See [TypeSafe’s confidence documentation](https://docs.typesafe.ai/confidence).
+The library also exports `evaluatePredictions(rows, options)` for existing predictions and supports custom column names and thresholds. `compareRowModes(packedResult, isolatedResult, options)` matches rows by key and reports decision agreement, changed rows, numeric movement, requests, tokens, cost, and wall time. Model confidence and the probability of one label are different quantities; neither substitutes for measured task accuracy. See [TypeSafe’s confidence documentation](https://docs.typesafe.ai/confidence).
+
+```js
+import { compareRowModes } from 'jevsql/evaluation';
+
+const report = compareRowModes(packedResult, isolatedResult, {
+  key: 'id',
+  fields: ['prediction', 'probability'],
+});
+```
 
 ## Query API and CLI
 
@@ -246,17 +266,31 @@ const preview = await engine.explain(sql, { params: { status: 'open' } });
 
 Await each operation before starting another on the same engine. Overlapping queries and closing an active engine are rejected. Independent engines may run concurrently. Do not modify the exposed database connection during an active operation.
 
-Useful flags include `--file`, `--params`, `--json`, `--audit`, `--quiet`, `--model`, `--cache-namespace`, `--max-judgments`, `--max-estimated-cost`, `--concurrency`, and `--dry-run`. See `node bin/jevsql.mjs --help` for all commands.
+Useful flags include `--file`, `--params`, `--json`, `--audit`, `--quiet`, `--model`, `--cache-namespace`, `--max-judgments`, `--max-estimated-cost`, `--concurrency`, `--isolate-rows`, and `--dry-run`. See `node bin/jevsql.mjs --help` for all commands.
 
 `--csv file[:table]` explicitly imports or replaces a table before the command runs. That import also happens for `explain` and `--dry-run`; use the default in-memory database when an import should not persist. Invalid headers and broken imports roll back instead of leaving a partial table.
 
 ## Cost, batching, and cache policy
 
-The collect pass discovers judgments, batches distinct states and questions, resolves responses, and reruns the original query. Ordinary SQL predicates can narrow candidates before inference. The planner counts serialized UTF-8 bytes, including prompts and rubrics, with default limits of 25 states, 120 questions, and 60,000 bytes per request. Questions for a single state split across batches when necessary; an oversized state/question pair is rejected.
+The collect pass discovers judgments, batches distinct states and questions, resolves responses, and reruns the original query. Ordinary SQL predicates can narrow candidates before inference. The planner counts serialized UTF-8 bytes, including prompts and rubrics, with default limits of 25 states, 120 questions, and 60,000 bytes per request. Questions for a single state split across batches when necessary; an oversized state/question pair is rejected. Set `rowMode: 'isolated'` or use `--isolate-rows` to keep unrelated rows out of the same TypeSafe state.
 
 `maxJudgments` is a firm cap on new judgments within a query, default 1,000. `maxEstimatedCostUsd` is an estimate-based stop before dispatching another round. Token estimates use serialized bytes divided by four; actual usage and billing can differ. Nested or conditional queries can discover more work in later rounds, so `explain()` is a planning estimate, not a spending guarantee. A late failure can occur after earlier requests were billed.
 
 Successful query stats include new judgments, cache hits, requests, input tokens, calculated cost, wall time, rounds, and relaxed clauses. Pricing currently uses the [published Jev rate](https://docs.typesafe.ai/models) of $0.042 per million input tokens, with free output tokens, checked on September 18, 2026.
+
+## TypeSafe pattern helpers
+
+Three optional library helpers cover patterns that do not fit a single SQL function:
+
+- `hierarchicalChoice()` from `jevsql/hierarchy` traverses a nested taxonomy with beam search, length-normalized path probability, and a rival-margin review gate.
+- `extractDate()` and `resolveDateParts()` from `jevsql/date-extraction` select bounded date parts, then validate dates and perform calendar arithmetic in code.
+- `routeApprovedFunction()` from `jevsql/function-router` selects one registered function and closed-set arguments. Registered defaults are applied in code, and a side-effecting handler cannot run without an affirmative confirmation callback.
+
+`JevClient.listModels()` reads the TypeSafe model endpoint. The client retries documented transient statuses, honors numeric and date-form `Retry-After`, rejects malformed JSON, and rejects responses missing requested answer IDs.
+
+## Quality gates
+
+`npm run test:coverage` enforces 95% line, 86% branch, and 95% function coverage. The current measured result is 95.98% lines, 87.46% branches, and 95.28% functions. `npm run test:mutation` mutates selected validation and SQL-safety paths and enforces a 75% behavioral floor against the measured 76.06% baseline. CI also runs the adapters against PostgreSQL and MySQL service containers through restricted read accounts.
 
 Cache identity includes the requested model, question type, instructions, criteria, source, and namespace. The new key format intentionally leaves earlier cache entries unused. Pin a version such as `jev-1.13.0` for a stable policy, and change the namespace when deliberately rejudging inputs. A moving model alias can mix older cached results with newer responses. Caching reuses a recorded answer; it does not prove that fresh model calls would return the same answer.
 
@@ -391,7 +425,7 @@ Keep arithmetic, date comparisons, access control, and actual writes in code. Je
 The software is tested; the claims a deployment would rest on are not. Being specific about the difference:
 
 - **No adjudicated corpus ships here.** The harness exists and is tested, but no accuracy, calibration, precision or reviewer-time figure has been measured on real data. Every such target remains open.
-- **The remote adapters are tested with fake drivers.** Restricted roles, transaction behaviour, statement timeouts, migration replay and rollback have not been exercised against a live PostgreSQL or MySQL server, and CI does not provision one.
+- **Real-database checks are configured in CI.** PostgreSQL 16 and MySQL 8.4 service jobs exercise restricted roles, schema reads, plans, tenant-bound reads, rollback, cancellation, statement timeouts and lock timeouts. Local runs skip these checks when servers are not configured, and this repository does not claim production reliability from a single CI job.
 - **Replay, seeding and index measurement run on SQLite.** They prove behaviour on the supplied fixtures and the current data volume, not on a production system.
 - **Remote schema snapshots stay narrower than local ones.** Optional catalogs are collected when the server answers and listed in `unavailableCatalogs` when it does not.
 - **Lineage discovery from SQL text is lexical.** Every edge it proposes is marked `discovered` and should be confirmed before being treated as fact.

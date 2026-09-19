@@ -87,6 +87,38 @@ test('control CLI qualifies holdout evidence conservatively and reports metadata
   const error = await run('schema', '--db', `${db}.missing`); assert.equal(error.code, 1);
 });
 
+test('control CLI deterministic dispatch covers audits, metrics, drift, and usage failures', async (t) => {
+  const { dir, json, run, client } = await setup(t);
+  const adversarial = await run('adversarial');
+  assert.equal(adversarial.code, 0, adversarial.stderr);
+  assert.equal(JSON.parse(adversarial.stdout).status, 'pass');
+
+  const metrics = await run('metrics', json('metrics', { rows: [
+    { id: 'a', expected: true, prediction: true, probability: 0.9 },
+    { id: 'b', expected: false, prediction: false, probability: 0.1 },
+  ] }));
+  assert.equal(metrics.code, 0, metrics.stderr);
+  assert.equal(JSON.parse(metrics.stdout).metrics.accuracy, 1);
+
+  const drift = await run('drift', json('drift', {
+    before: { dialect: 'sqlite', tables: [{ name: 't', columns: [{ name: 'id', type: 'INTEGER', primaryKey: 1 }] }] },
+    after: { dialect: 'sqlite', tables: [] },
+  }));
+  assert.equal(drift.code, 2, drift.stderr);
+  assert.equal(JSON.parse(drift.stdout).decision, 'block');
+
+  const corpusFile = path.join(dir, 'corpus.sqlite');
+  const corpus = await run('corpus', '--store', corpusFile);
+  assert.equal(corpus.code, 2, corpus.stderr);
+  assert.equal(JSON.parse(corpus.stdout).status, 'review');
+
+  assert.equal((await run('feedback', json('unused', {}), '--store', corpusFile, '--dry-run')).code, 1);
+  assert.equal((await run('unknown-command')).code, 1);
+  assert.equal((await run('metrics')).code, 1);
+  assert.equal((await run('metrics', json('extra-a', {}), json('extra-b', {}))).code, 1);
+  assert.equal(client.calls.length, 0);
+});
+
 test('offline control demo exercises tenant isolation, stale permits, drift, telemetry and held-out limits', async () => {
   const report = await runControlDemo();
   assert.equal(report.usage.requests, 0);

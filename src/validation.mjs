@@ -72,9 +72,15 @@ export function validateAnswer(answer, question) {
       throw new Error('Answer choice is not the highest-probability option.');
     }
   }
-  if (question.kind === 'score' && (typeof answer.score !== 'number'
-      || !Number.isFinite(answer.score) || answer.score < 0 || answer.score > labels.length - 1)) {
-    throw new Error('Answer score is outside the supplied levels.');
+  if (question.kind === 'score') {
+    if (typeof answer.score !== 'number' || !Number.isFinite(answer.score)
+        || answer.score < 0 || answer.score > labels.length - 1) {
+      throw new Error('Answer score is outside the supplied levels.');
+    }
+    const expected = labels.reduce((total, label, index) => total + index * probabilities[label], 0);
+    if (Math.abs(answer.score - expected) > 0.02) {
+      throw new Error('Answer score is not the probability-weighted value of its levels.');
+    }
   }
   return answer;
 }

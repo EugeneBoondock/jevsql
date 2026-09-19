@@ -55,6 +55,20 @@ test('all rows and questions collapse into one batched request', async () => {
   });
 });
 
+test('isolated row mode keeps questions together but never mixes row state', async () => {
+  await withEngine(async (engine, mock) => {
+    const { stats } = await engine.query(`
+      SELECT jev_noul(body, 'Is this urgent?'),
+             jev_choice(body, 'Which team?', 'billing,technical,sales')
+      FROM tickets WHERE id <= 3`);
+    assert.equal(stats.rowMode, 'isolated');
+    assert.equal(mock.requestCount, 3);
+    assert.ok(mock.calls.every((call) => Object.keys(call.state.rows).length === 1));
+    assert.ok(mock.calls.every((call) => Object.keys(call.questions).length === 2));
+  }, { rowMode: 'isolated' });
+  assert.throws(() => new JevSQL({ rowMode: 'unknown' }), /rowMode/);
+});
+
 test('a jev predicate in WHERE is relaxed while collecting, then applied exactly', async () => {
   await withEngine(async (engine, mock) => {
     const { rows, stats } = await engine.query(
@@ -73,11 +87,15 @@ test('functions sharing one judgment cost a single question', async () => {
       SELECT id,
              jev_choice(body, 'Which team?', 'billing,technical,sales') AS team,
              jev_choice_conf(body, 'Which team?', 'billing,technical,sales') AS conf,
-             jev_prob(body, 'Which team?', 'billing,technical,sales', 'billing') AS p_billing
+             jev_prob(body, 'Which team?', 'billing,technical,sales', 'billing') AS p_billing,
+             jev_choice_top_prob(body, 'Which team?', 'billing,technical,sales') AS p_top,
+             jev_choice_prob_gate(body, 'Which team?', 'billing,technical,sales', 0.75) AS gated
       FROM tickets WHERE id = 5`);
     assert.equal(Object.keys(mock.calls[0].questions).length, 1, 'three functions, one question');
     assert.equal(rows[0].team, 'billing');
     assert.ok(rows[0].conf > 0.5 && rows[0].p_billing > 0.5);
+    assert.equal(rows[0].p_top, rows[0].p_billing);
+    assert.equal(rows[0].gated, 'billing');
   });
 });
 

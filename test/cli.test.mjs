@@ -91,7 +91,8 @@ test('offline workflow tour exercises every recipe and preserves a normal SQLite
   assert.equal(tour.extraction.rows[1].invoice_email, null);
   assert.equal(tour.matches.rows.length, 2);
   assert.equal(tour.matches.rows[0].match_probability, 0.97);
-  assert.equal(tour.ranking.rows.length, 2);
+  assert.equal(tour.ranking.rows.length, 1);
+  assert.ok(tour.ranking.rows[0].answer_probability > 0.5);
   assert.equal(tour.warm.stats.requests, 0);
   assert.equal(tour.changed.stats.judgments, 1);
   assert.equal(tour.changed.changes.updated[0].after.prediction, 'contradicted');

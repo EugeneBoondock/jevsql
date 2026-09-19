@@ -8,7 +8,7 @@ Scope: the three supplied research documents, re-read in full, compared against 
 
 **The eight defects the previous audit reported are fixed, each with a regression test that asserts on what leaves the process rather than only on returned rows. Four coverage gaps are closed, and the highest-priority capability named in document A — the typed guardrail in front of an agent-issued statement — is now implemented.** The evaluation and operational evidence the documents ask for is still not produced, and is listed explicitly below rather than implied.
 
-Suite: **284 tests passed, 0 failed** on Node 22.20.0. Both offline demos run. No live TypeSafe requests and no PostgreSQL/MySQL server tests were made.
+Current suite: **378 tests passed, 0 failed, 2 real-server checks skipped locally**. Both offline demos run. A live synthetic TypeSafe workflow passed against `jev-1.13.0`. PostgreSQL and MySQL service tests are configured in CI and are skipped locally when their servers are unavailable.
 
 ## Source documents
 
@@ -71,7 +71,7 @@ Views and triggers now participate in the schema snapshot, hash and diff, so a r
 These remain open. None is a code-level defect; they are the evidence a deployment would rest on.
 
 - **No adjudicated evaluation corpus ships here.** Document B proposes roughly 1,000 cases: 400 request/SQL pairs, 250 migrations, 350 incidents. The store, the split discipline, the labelling workflow and the metrics are implemented and tested. The cases do not exist, so every accuracy, calibration, precision, recall, reviewer-time and triage-time target remains unproven. `promotionStatus` reports this rather than hiding it: with no corpus, the ladder sits below its first rung.
-- **No live PostgreSQL or MySQL verification.** The adapters are tested with fake drivers. Restricted roles, transaction behaviour, cancellation and statement timeouts have not been exercised against a real server, and CI does not provision one. Replay, seeding and index measurement run on SQLite, so they establish behaviour on the supplied fixtures and the current data volume, not on a production system.
+- **Real PostgreSQL and MySQL checks need an evidence history.** CI provisions PostgreSQL 16 and MySQL 8.4 and tests restricted roles, schema reads, plans, tenant-bound reads, rollback, cancellation, statement timeouts and lock timeouts. The checks are skipped locally when those servers are unavailable. Replay, seeding and index measurement still run on SQLite, so they establish behaviour on the supplied fixtures and the current data volume, not on a production system.
 - **No shadow pilot has been run.** The runner exists; no production traffic has been scored with it.
 - **Collation is absent from remote snapshots**, so the join-multiplication proof falls back to treating both sides as the default collation. That is correct for SQLite and unverified for a MySQL catalog whose columns genuinely differ.
 - **Lineage discovery from SQL text is lexical.** Every edge it proposes is marked `discovered`; confirming them is a human step.

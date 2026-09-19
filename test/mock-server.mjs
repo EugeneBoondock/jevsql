@@ -45,7 +45,7 @@ export async function startMockServer({ latencyMs = 0, answerFor } = {}) {
         const probabilities = Object.fromEntries(levels.map((_, i) => [String(i), i === top ? 0.85 : 0.15 / (levels.length - 1 || 1)]));
         answers[id] = {
           type: 'score',
-          score: top * 0.85 + (top > 0 ? (top - 1) * 0.05 : 0),
+          score: levels.reduce((total, _, index) => total + index * probabilities[String(index)], 0),
           legend: Object.fromEntries(levels.map((l, i) => [String(i), l])),
           probabilities,
           confidence: 0.8,

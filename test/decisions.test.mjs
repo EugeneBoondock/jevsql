@@ -21,6 +21,20 @@ test('JSON option descriptions and structured levels reach the provider intact',
   assert.deepEqual(judgmentFor('jev_score', ['text', 'Severity?', JSON.stringify(levels)]).criteria, levels);
 });
 
+test('structured Noul criteria reach the provider and remain part of judgment identity', () => {
+  const criteria = { true: { all: ['same legal entity', 'compatible address'] }, false: 'Different entities' };
+  const raw = JSON.stringify(criteria);
+  const noul = judgmentFor('jev_noul', ['text', 'question', raw]);
+  assert.deepEqual(questionBody(noul, 'rows.r0').criteria, criteria);
+  assert.equal(judgmentKey('m', noul), judgmentKey('m', judgmentFor('jev_bool', ['text', 'question', 0.7, raw])));
+  assert.notEqual(judgmentKey('m', noul), judgmentKey('m', judgmentFor('jev_noul', ['text', 'question'])));
+  assert.deepEqual(judgmentFor('jev_decide', ['text', 'question', 0.2, 0.8, raw]).criteria, criteria);
+  assert.deepEqual(judgmentFor('jev_match', ['left', 'right', 'same?', raw]).criteria, criteria);
+  for (const bad of ['{}', '{"true":"yes"}', '[]', 'plain text', '{bad']) {
+    assert.throws(() => judgmentFor('jev_noul', ['text', 'question', bad]), /criteria/);
+  }
+});
+
 test('normalized score and probability projections reuse their original judgment', () => {
   const args = ['text', 'severity', 'calm,frustrated,angry'];
   const score = judgmentFor('jev_score_norm', args);
@@ -28,6 +42,16 @@ test('normalized score and probability projections reuse their original judgment
   assert.equal(judgmentKey('m', score), judgmentKey('m', judgmentFor('jev_score', args)));
   const distribution = judgmentFor('jev_choice_probs', args);
   assert.deepEqual(JSON.parse(distribution.read({ probabilities: { calm: 1, frustrated: 0, angry: 0 } })), { calm: 1, frustrated: 0, angry: 0 });
+});
+
+test('winning Choice probability can be read and used as the abstention gate', () => {
+  const args = ['text', 'team', 'billing,technical'];
+  const answer = { choice: 'technical', confidence: 0.99, probabilities: { billing: 0.35, technical: 0.65 } };
+  const top = judgmentFor('jev_choice_top_prob', args);
+  assert.equal(top.read(answer), 0.65);
+  assert.equal(judgmentFor('jev_choice_prob_gate', [...args, 0.6]).read(answer), 'technical');
+  assert.equal(judgmentFor('jev_choice_prob_gate', [...args, 0.7]).read(answer), null);
+  assert.equal(judgmentKey('m', top), judgmentKey('m', judgmentFor('jev_choice', args)));
 });
 
 test('bad rubric sizes, labels and thresholds fail locally', () => {

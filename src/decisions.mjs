@@ -1,6 +1,27 @@
 import { probability, stableJson, structured } from './validation.mjs';
 
-export const DECISION_FUNCTIONS = ['jev_decide', 'jev_match', 'jev_choice_probs', 'jev_score_norm', 'jev_score_probs', 'jev_pick', 'jev_pick_conf'];
+export const DECISION_FUNCTIONS = [
+  'jev_decide', 'jev_match',
+  'jev_choice_probs', 'jev_choice_top_prob', 'jev_choice_prob_gate',
+  'jev_score_norm', 'jev_score_probs', 'jev_pick', 'jev_pick_conf',
+];
+
+/** Optional TypeSafe Noul rubric with explicit true and false definitions. */
+export function parseNoulCriteria(raw) {
+  if (raw == null) return null;
+  const value = structured(raw);
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError('Noul criteria must be a JSON object with true and false definitions.');
+  }
+  const keys = Object.keys(value);
+  if (keys.length !== 2 || !keys.includes('true') || !keys.includes('false')
+      || value.true == null || value.false == null
+      || (typeof value.true === 'string' && !value.true.trim())
+      || (typeof value.false === 'string' && !value.false.trim())) {
+    throw new TypeError('Noul criteria must define non-empty true and false cases.');
+  }
+  return value;
+}
 
 export function parseCriteria(raw, kind) {
   let value = structured(raw);
@@ -45,11 +66,11 @@ export function decisionJudgment(fnName, args, base) {
     const low = probability(args[2] ?? 0.1, 'low threshold');
     const high = probability(args[3] ?? 0.9, 'high threshold');
     if (low >= high) throw new TypeError('The low threshold must be below the high threshold.');
-    return { kind: 'noul', state, question, criteria: null, read: (a) => a.noul < low ? 0 : a.noul > high ? 1 : null };
+    return { kind: 'noul', state, question, criteria: parseNoulCriteria(args[4]), read: (a) => a.noul < low ? 0 : a.noul > high ? 1 : null };
   }
   if (fnName === 'jev_match') {
     return {
-      kind: 'noul', criteria: null,
+      kind: 'noul', criteria: parseNoulCriteria(args[3]),
       state: stableJson({ left: structured(args[0]), right: structured(args[1]) }),
       question: structured(args[2] ?? 'Do the left and right records refer to the same real-world entity?'),
       read: (a) => a.noul,
@@ -58,6 +79,16 @@ export function decisionJudgment(fnName, args, base) {
   if (fnName === 'jev_choice_probs') return {
     kind: 'choice', state, question, criteria: parseCriteria(args[2], 'choice'), read: (a) => JSON.stringify(a.probabilities),
   };
+  if (fnName === 'jev_choice_top_prob') return {
+    kind: 'choice', state, question, criteria: parseCriteria(args[2], 'choice'), read: (a) => a.probabilities[a.choice],
+  };
+  if (fnName === 'jev_choice_prob_gate') {
+    const min = probability(args[3] ?? 0.8, 'minimum winning probability');
+    return {
+      kind: 'choice', state, question, criteria: parseCriteria(args[2], 'choice'),
+      read: (a) => a.probabilities[a.choice] >= min ? a.choice : null,
+    };
+  }
   if (fnName === 'jev_score_norm' || fnName === 'jev_score_probs') {
     const criteria = parseCriteria(args[2], 'score');
     return { kind: 'score', state, question, criteria,
