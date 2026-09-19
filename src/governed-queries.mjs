@@ -90,11 +90,19 @@ export class GovernedQueries {
           : compiled.tenantScopedTables.length ? 'authenticated current tenant'
             : 'authenticated actor, but no table in this query carries a tenant filter',
         tenantFilteredTables: compiled.tenantScopedTables, tablesDeclaredShared: compiled.sharedTables, parameterBinding: 'All values are bound by the trusted compiler; tenant values come from the authenticated actor.',
-        maximumResultRows: compiled.maxRows } }, {
+        maximumResultRows: compiled.maxRows,
+        // A row cap on its own reads as "the first N", which is only true when
+        // the ordering settles every tie. When it does not, the same approved
+        // template can answer with a different N rows after a plan change, so
+        // the reviewer is told which of the two they are approving.
+        resultWindow: compiled.ordering.total
+          ? 'Ordered definitely: the same rows in the same sequence for the same data.'
+          : `An arbitrary window. The ordering leaves ties, so which rows come back can change when the query plan does. Ordering by ${compiled.ordering.missing.map((names) => names.join(' + ')).join(', or ')} would settle it.` } }, {
       context: { dialect: compiled.dialect, schemaVersion: compiled.schemaHash, templateVersion: template.version,
         templateHash: compiled.templateHash, actorHash: compiled.actorHash, paramsHash: compiled.paramsHash }, signal, dryRun,
     });
     const preview = { sql: compiled.sql, dialect: compiled.dialect, columns: compiled.columns, maxRows: compiled.maxRows,
+      ordering: compiled.ordering,
       templateId, templateVersion: template.version, schemaHash: compiled.schemaHash };
     if (dryRun) return { dryRun: true, decision: null, receipt, preview, permit: null };
     let permit = null;

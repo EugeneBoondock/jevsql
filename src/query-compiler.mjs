@@ -6,6 +6,74 @@ const AGGREGATES = new Set(['sum', 'avg', 'count', 'min', 'max']);
 const DIALECTS = new Set(['sqlite', 'postgresql', 'mysql']);
 const COMPILED = new WeakSet();
 export const isCompiledQuery = (value) => COMPILED.has(value);
+
+/**
+ * The keys that actually identify one row of a table.
+ *
+ * A key only identifies a row if it cannot be null. SQLite is the trap here:
+ * a UNIQUE index treats every NULL as distinct, so a nullable unique column
+ * admits any number of rows, and a PRIMARY KEY that is not INTEGER PRIMARY KEY
+ * accepts NULLs too. Either would look like a key and order nothing.
+ *
+ * @returns {string[][]} each entry a set of column names that is unique together
+ */
+function identifyingKeys(table) {
+  const column = (name) => table.columns.find((entry) => entry.name === name);
+  const usable = (names) => names.length > 0 && names.every((name) => {
+    const found = column(name);
+    return found && found.nullable === false;
+  });
+  const keys = [];
+  const primary = table.columns.filter((entry) => entry.primaryKey)
+    .sort((a, b) => Number(a.primaryKey) - Number(b.primaryKey)).map((entry) => entry.name);
+  // An INTEGER PRIMARY KEY is the rowid: never null whatever the column says.
+  const rowid = primary.length === 1 && /^INTEGER$/i.test(String(column(primary[0])?.type ?? '').trim());
+  if (primary.length && (rowid || usable(primary))) keys.push(primary);
+  for (const index of table.indexes ?? []) {
+    if (!index.unique || index.partial) continue;
+    const names = (index.columns ?? []).filter((name) => name != null);
+    if (names.length === (index.columns ?? []).length && usable(names)) keys.push(names);
+  }
+  return keys;
+}
+
+/**
+ * Does this ORDER BY put the result rows in one definite sequence?
+ *
+ * A LIMIT without a total order returns an arbitrary window: the rows are
+ * whichever ones the current plan reached first. Change an index and the same
+ * approved query answers with a different set, no error and no warning. An
+ * ORDER BY is not protection on its own — ties inside it are broken by
+ * whatever the plan happens to do.
+ *
+ * What makes a result total depends on its grain:
+ *   - an aggregate with no GROUP BY is a single row, so anything orders it
+ *   - a GROUP BY makes one row per group, so ordering by the grouped columns
+ *     is enough
+ *   - otherwise a row is one base row per multiplicative join, so each of
+ *     those tables needs a full identifying key in the ordering
+ *
+ * @returns {{total: boolean, reason: string, missing: string[][]}} missing lists
+ *   the column sets that would each be enough to finish the ordering
+ */
+function orderingTotality({ ordered, grouped, aggregated, base, multiplicative }) {
+  const covers = (names, table) => names.every((name) => ordered.has(`${table.name}.${name}`));
+  if (aggregated && !grouped.length) return { total: true, reason: 'single-row aggregate', missing: [] };
+  if (grouped.length) {
+    const uncovered = grouped.filter((entry) => !ordered.has(entry.key));
+    return uncovered.length
+      ? { total: false, reason: 'grouped', missing: [uncovered.map((entry) => entry.key)] }
+      : { total: true, reason: 'grouped', missing: [] };
+  }
+  const missing = [];
+  for (const table of [base, ...multiplicative]) {
+    const keys = identifyingKeys(table);
+    if (!keys.length) { missing.push([`${table.name}.<no identifying key>`]); continue; }
+    if (keys.some((names) => covers(names, table))) continue;
+    for (const names of keys) missing.push(names.map((name) => `${table.name}.${name}`));
+  }
+  return { total: !missing.length, reason: 'rows', missing };
+}
 function keys(value, allowed, name) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new TypeError(`${name} must be an object.`);
   for (const key of Object.keys(value)) if (!allowed.includes(key)) throw new TypeError(`Unsupported ${name} field: ${key}.`);
@@ -56,7 +124,7 @@ export function parameterValue(value, spec, name) {
  * dynamic expressions, arbitrary functions, or model-generated values are accepted.
  * The server supplies actor and tenantColumns independently from the request text.
  */
-export function compileTemplate(input, schema, { params = {}, actor, tenantColumns = {}, maxRows = 500 } = {}) {
+export function compileTemplate(input, schema, { params = {}, actor, tenantColumns = {}, maxRows = 500, requireTotalOrder = false } = {}) {
   const template = jsonData(input), identity = actorIdentity(actor);
   named(template.id, 'template.id'); named(template.version, 'template.version');
   named(template.description, 'template.description');
@@ -171,7 +239,7 @@ export function compileTemplate(input, schema, { params = {}, actor, tenantColum
     const unique = (same(primary, rightCols) && matches(rightCols.map((column) => collationOf(columnOf(next, column)?.collation))))
       || (next.indexes ?? []).some((index) => index.unique && !index.partial && same(index.columns, rightCols)
         && matches(rightCols.map((column, i) => collationOf(index.terms?.[i]?.collation ?? columnOf(next, column)?.collation))));
-    if (!unique) multiplicative.push(next.name);
+    if (!unique) multiplicative.push(next);
     const kind = (join.type ?? 'inner').toLowerCase();
     if (!['inner', 'left'].includes(kind)) throw new Error('Only explicit inner and left joins are supported.');
     const conditions = resolved.map(([left, right]) => `${left.sql} = ${right.sql}`);
@@ -179,7 +247,9 @@ export function compileTemplate(input, schema, { params = {}, actor, tenantColum
     joinSql.push(`${kind.toUpperCase()} JOIN ${relation(next.name)} AS ${quote(next.alias)} ON ${conditions.join(' AND ')}`);
   }
   if (!Array.isArray(query.select) || !query.select.length) throw new Error('Select explicit columns or aggregates.');
-  const aliases = new Set(), plainColumns = [], aggregates = [];
+  // Ordering is by output alias, so proving an ordering identifies a row means
+  // knowing which source column each alias came from.
+  const aliases = new Set(), plainColumns = [], aggregates = [], aliasSource = new Map();
   const select = query.select.map((entry) => {
     keys(entry, ['column', 'as', 'aggregate', 'distinct'], 'selection');
     named(entry.as, 'selection alias');
@@ -195,6 +265,7 @@ export function compileTemplate(input, schema, { params = {}, actor, tenantColum
     } else {
       if (entry.distinct !== undefined) throw new Error('distinct is only supported on an aggregate.');
       const ref = resolve(entry.column); expression = ref.sql; plainColumns.push(ref.key);
+      aliasSource.set(entry.as.toLowerCase(), ref.key);
     }
     return `${expression} AS ${quote(entry.as)}`;
   });
@@ -230,12 +301,22 @@ export function compileTemplate(input, schema, { params = {}, actor, tenantColum
     if (!aliases.has(String(entry.column).toLowerCase())) throw new Error('Order by a selected output alias.');
     return `${quote(entry.column)} ${direction.toUpperCase()}`;
   });
+  const ordered = new Set((query.orderBy ?? [])
+    .map((entry) => aliasSource.get(String(entry.column).toLowerCase())).filter(Boolean));
+  const ordering = orderingTotality({
+    ordered, grouped: groups, aggregated: aggregates.length > 0, base, multiplicative,
+  });
+  if (requireTotalOrder && !ordering.total) {
+    const remedy = ordering.missing.map((names) => names.join(' + ')).join(', or ');
+    throw new Error(`This query takes a LIMIT without ordering its rows definitely, so it returns an arbitrary window that can change when the plan does. Order by ${remedy}, or compile without requireTotalOrder to accept an arbitrary sample.`);
+  }
   const limit = integer(query.limit ?? 100, 'query limit', 1, maxRows);
   const sql = `SELECT ${select.join(', ')} FROM ${relation(base.name)} AS ${quote(base.alias)}`
     + (joinSql.length ? ` ${joinSql.join(' ')}` : '') + (where.length ? ` WHERE ${where.join(' AND ')}` : '')
     + (groups.length ? ` GROUP BY ${groups.map((group) => group.sql).join(', ')}` : '')
     + (order.length ? ` ORDER BY ${order.join(', ')}` : '') + ` LIMIT ${bind(limit)}`;
   const result = { sql, values: Object.freeze(values), dialect, maxRows: limit, columns: Object.freeze(query.select.map((entry) => entry.as)),
+    ordering: Object.freeze({ ...ordering, missing: Object.freeze(ordering.missing.map((names) => Object.freeze(names))) }),
     tables: [...used.keys()], tenantScopedTables: Object.freeze([...tenantScopedTables]),
     sharedTables: Object.freeze([...sharedTables]), templateId: template.id, templateVersion: template.version,
     templateHash: digest(template), schemaHash: schema.hash ?? digest(schema), actorHash: digest(identity), paramsHash: digest(params) };
