@@ -83,3 +83,47 @@ test('the review of a CTE-hidden delete asks for a person out of band', async (t
   assert.equal(review.classification.destructive, true);
   assert.equal(review.requiredApproval, 'out_of_band_human');
 });
+
+test('the keyword bag is read from the dialect-aware mask', () => {
+  // maskSql knows nothing about PostgreSQL dollar-quoting, so the words inside
+  // $$...$$ used to land in the keyword bag: a plain read came back as
+  // operation: schema, destructive: true, and a legitimate query was escalated
+  // to a person. sqlMetadata already handles it, and the reviewer is shown its
+  // output, so the classification has to agree with what the reviewer reads.
+  const benign = classifyStatement('SELECT $$ drop table users $$::text', { dialect: 'postgresql' });
+  assert.equal(benign.operation, 'read');
+  assert.equal(benign.destructive, false);
+  assert.equal(benign.changesSchema, false);
+
+  // And the same masking must not hide a real write behind quoted text.
+  const hidden = classifyStatement(
+    'WITH gone AS (DELETE FROM users RETURNING id, $$where$$ AS note) SELECT count(*) FROM gone',
+    { dialect: 'postgresql' });
+  assert.equal(hidden.operation, 'delete');
+  assert.equal(hidden.filtered, false, 'a quoted "where" is text, not a qualifier');
+  assert.equal(hidden.destructive, true);
+});
+
+test('SQL nobody can parse is unknown and unsafe, not an exception', () => {
+  // The contract in the doc comment is that anything unresolvable is unknown
+  // and never auto-runs. It threw instead, so an unclosed quote — routine in
+  // text a model wrote — crashed the review rather than being refused by it.
+  for (const sql of ["SELECT * FROM t WHERE a = 'x", 'SELECT "col FROM t', 'SELECT * FROM t /* open']) {
+    const classified = classifyStatement(sql);
+    assert.equal(classified.operation, 'unknown', sql);
+    assert.equal(classified.destructive, true, 'unparseable is not evidence of harmless');
+    assert.equal(classified.unbounded, true, sql);
+    assert.match(classified.reasons[0], /could not be parsed/);
+    assert.equal(classified.sql, null, 'there is no masked text to show a reviewer');
+  }
+});
+
+test('a review of unparseable SQL is refused rather than thrown', async (t) => {
+  const service = new DecisionService({ client });
+  t.after(async () => { await service.close(); });
+  const control = new DatabaseControl({ service });
+  const review = await control.reviewStatement({ statement: "SELECT * FROM t WHERE a = 'x", intent: 'Read a row.' });
+  assert.equal(review.classification.operation, 'unknown');
+  assert.ok(review.findings.some((finding) => finding.code === 'unclassified_operation'));
+  assert.notEqual(review.requiredApproval, 'none');
+});

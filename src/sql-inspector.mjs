@@ -91,11 +91,39 @@ const CLASS_BY_HEAD = {
  *   sql: string, dialect: string}}
  */
 export function classifyStatement(input, { dialect = 'sqlite' } = {}) {
-  const metadata = sqlMetadata(input, { dialect });
-  const masked = maskSql(input);
+  let metadata;
+  try {
+    metadata = sqlMetadata(input, { dialect });
+  } catch (error) {
+    /*
+     * The contract above says anything this cannot resolve is unknown, which
+     * never auto-runs. It threw instead: a SyntaxError from sqlMetadata or
+     * maskSql travelled straight out through reviewStatement, so an unclosed
+     * quote — routine in text a model wrote — crashed the review rather than
+     * being refused by it.
+     *
+     * Unknown AND unsafe. A statement nobody could parse is not evidence of a
+     * harmless one.
+     */
+    if (!(error instanceof SyntaxError)) throw error;
+    return { operation: 'unknown', statementCount: 1, changesData: false, changesSchema: false,
+      changesPermissions: false, destructive: true, unbounded: true, filtered: false, limited: false,
+      reasons: [`could not be parsed: ${error.message.replace(/\.$/, '').toLowerCase()}`],
+      sql: null, dialect };
+  }
+  /*
+   * Read the words from the DIALECT-AWARE mask, not from maskSql.
+   *
+   * maskSql knows nothing about PostgreSQL dollar-quoting or MySQL backslash
+   * escapes, so `SELECT $$ drop table users $$::text` put DROP and TABLE into
+   * the keyword bag and a plain read came back as operation: schema,
+   * destructive: true. sqlMetadata already handles both, and its output is
+   * what the reviewer is shown, so the classification should agree with it.
+   */
+  const masked = metadata.sql;
   const words = [...masked.matchAll(/[A-Za-z_][A-Za-z0-9_]*/g)].map((match) => match[0].toUpperCase());
   const has = (word) => words.includes(word);
-  const outer = topLevelWords(input);
+  const outer = topLevelWords(masked);
   const head = outer[0]?.word ?? words[0] ?? null;
   const statementCount = [...masked.matchAll(/;/g)].filter((match) => masked.slice(match.index + 1).trim()).length + 1;
   const changesData = DATA_WRITES.some(has);
