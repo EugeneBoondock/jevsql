@@ -4,6 +4,10 @@
 
 # JevSQL
 
+For PostgreSQL or other already-authorized result sets, use the
+[native row API](docs/native-rows.md): typed decisions, explicit projections,
+tenant-scoped caching, budgets, cancellation, and review queues without SQLite.
+
 **Turn database rows into decisions you can query, inspect, refresh, and test.**
 
 JevSQL adds TypeSafe Jev judgments to SQLite. It can compare records by meaning, select exact evidence from text, rank retrieved passages, route uncertain results to review, and detect when a changed source invalidates an earlier decision. It runs as a Node library or CLI with zero runtime dependencies.

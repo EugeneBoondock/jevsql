@@ -5,6 +5,8 @@
   "type": "module",
   "main": "src/engine.mjs",
   "exports": {
+    "./rows": "./src/rows.mjs",
+    "./pg-cache": "./src/pg-cache.mjs",
     ".": "./src/engine.mjs",
     "./client": "./src/client.mjs",
     "./cache": "./src/cache.mjs",
